@@ -234,7 +234,7 @@ def augment_dataset(X: np.ndarray, y: np.ndarray,
     # Build an array of how many augmented copies each sample gets
     aug_counts = np.full(n_orig, n_augmented_per_sample, dtype=int)
 
-    if balance_classes and len(classes) == 2:
+    if balance_classes and len(classes) >= 2:
         majority_count = counts.max()
         for cls, count in zip(classes, counts):
             if count < majority_count:

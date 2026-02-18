@@ -9,13 +9,21 @@ Anthony Contreras & Alex Wong | San Jose State University
   Phase 2: Domain-adapt on plant + Adamatzky fungal signals (2-class, shift domain)
   Phase 3: Fine-tune on Buffi + synthetic fungal data (2-class, target task)
 
+Vocabulary mode (--mode vocabulary):
+  Phase 1: Same ECG pre-training
+  Phase 2: Train on vocabulary-labeled Adamatzky data (k-class spike word types)
+  Phase 3: Fine-tune on stimulus-labeled Buffi data (5-class: 4 stimuli + baseline)
+
 Usage:
-    python train_tcn.py --phase 1           # Pre-train on ECG
-    python train_tcn.py --phase 2           # Domain-adapt on plant+Adamatzky
-    python train_tcn.py --phase 3           # Fine-tune on Buffi+synthetic
-    python train_tcn.py --phase all         # Run all 3 sequentially
-    python train_tcn.py --phase 3 --full    # Colab mode (bigger batch, more epochs)
-    python train_tcn.py --evaluate          # Load tcn_final.pt + compare with RF/SVM
+    python train_tcn.py --phase 1                      # Pre-train on ECG
+    python train_tcn.py --phase 2                      # Domain-adapt (binary)
+    python train_tcn.py --phase 3                      # Fine-tune (binary)
+    python train_tcn.py --phase all                    # Run all 3 sequentially
+    python train_tcn.py --phase 3 --full               # Colab mode
+    python train_tcn.py --evaluate                     # Evaluate binary model
+    python train_tcn.py --mode vocabulary --phase 2    # Vocabulary Phase 2
+    python train_tcn.py --mode vocabulary --phase 3    # Stimulus Phase 3
+    python train_tcn.py --mode vocabulary --phase all  # Full vocabulary pipeline
 """
 
 import numpy as np
@@ -45,8 +53,9 @@ import matplotlib.pyplot as plt
 # Local imports
 from tcn_model import build_tcn, count_parameters
 from data_loader import (
-    load_all_data, load_adamatzky_data, segment_windows,
-    WINDOW_SAMPLES, SAMPLE_RATE
+    load_all_data, load_adamatzky_data, load_synthetic_data,
+    load_buffi_stimulus_labeled, load_vocabulary_labeled,
+    segment_windows, WINDOW_SAMPLES, SAMPLE_RATE
 )
 from augmentation import augment_dataset, normalize_signal
 
@@ -65,6 +74,11 @@ PLOTS_DIR = os.path.join(PROJECT_ROOT, 'data', 'ml_results')
 CHECKPOINT_PHASE1 = os.path.join(MODELS_DIR, 'tcn_phase1_ecg.pt')
 CHECKPOINT_PHASE2 = os.path.join(MODELS_DIR, 'tcn_phase2_adapted.pt')
 CHECKPOINT_FINAL = os.path.join(MODELS_DIR, 'tcn_final.pt')
+
+# Vocabulary mode checkpoints
+CHECKPOINT_PHASE2_VOCAB = os.path.join(MODELS_DIR, 'tcn_phase2_vocabulary.pt')
+CHECKPOINT_PHASE3_STIMULUS = os.path.join(MODELS_DIR, 'tcn_phase3_stimulus.pt')
+VOCAB_LABELS_PATH = os.path.join(MODELS_DIR, 'vocabulary_labels.npz')
 
 # Track start time
 _t0 = time.time()
@@ -614,6 +628,236 @@ def run_phase3(device, batch_size=32, epochs=10, lr=1e-4, num_workers=0):
 
 
 # ============================================================
+# VOCABULARY MODE — PHASE 2: VOCABULARY CLASSIFICATION
+# ============================================================
+
+def run_phase2_vocabulary(device, batch_size=32, epochs=10, lr=1e-4, num_workers=0):
+    """Phase 2 (vocabulary): Train on k-class vocabulary labels from spike clustering."""
+    print("\n" + "=" * 60)
+    print("PHASE 2 (VOCABULARY): CLASSIFY SPIKE WORD TYPES")
+    print("=" * 60)
+
+    # Load vocabulary-labeled data (from spike_vocabulary.py)
+    print("\n  Loading vocabulary-labeled windows...")
+    X, y = load_vocabulary_labeled(VOCAB_LABELS_PATH)
+
+    if X.shape[0] == 0:
+        print("  No vocabulary data — run spike_vocabulary.py first")
+        return None
+
+    K = len(np.unique(y))
+    print(f"  {X.shape[0]} windows, {K} classes (word types + silence)")
+
+    # Augment to balance classes
+    X, y = augment_dataset(X, y, n_augmented_per_sample=2, balance_classes=True)
+    print(f"  After augmentation: {X.shape[0]} windows")
+    log_memory("After vocab data load + augment")
+
+    # Train/val split
+    X_train, X_val, y_train, y_val = train_test_split(
+        X, y, test_size=0.2, random_state=42, stratify=y
+    )
+    train_loader = make_loader(X_train, y_train, batch_size, num_workers=num_workers)
+    val_loader = make_loader(X_val, y_val, batch_size, shuffle=False, num_workers=num_workers)
+
+    del X, y, X_train, X_val, y_train, y_val
+    gc.collect()
+
+    # Load Phase 1 checkpoint or build fresh
+    model = build_tcn(n_classes=5)
+    if os.path.exists(CHECKPOINT_PHASE1):
+        print(f"\n  Loading Phase 1 checkpoint: {CHECKPOINT_PHASE1}")
+        model.load_state_dict(torch.load(CHECKPOINT_PHASE1, map_location='cpu', weights_only=True))
+    else:
+        print("\n  No Phase 1 checkpoint — starting from scratch")
+
+    # Replace head for K classes and freeze early blocks
+    model.replace_head(new_n_classes=K)
+    model.freeze_early_blocks(n=2)
+    total, trainable = count_parameters(model)
+    print(f"  Model: {total:,} total, {trainable:,} trainable (blocks 3-4 + head)")
+    model = model.to(device)
+
+    # Train
+    best_loss, history = train_phase(
+        model, train_loader, val_loader, epochs, lr, device,
+        patience=3, phase_name="Phase2-Vocab"
+    )
+    print(f"  Best val loss: {best_loss:.4f}")
+
+    # Save checkpoint
+    save_checkpoint(model, CHECKPOINT_PHASE2_VOCAB)
+    log_memory("Phase 2 (vocabulary) complete")
+
+    return model
+
+
+# ============================================================
+# VOCABULARY MODE — PHASE 3: STIMULUS RESPONSE
+# ============================================================
+
+def run_phase3_stimulus(device, batch_size=32, epochs=10, lr=1e-4, num_workers=0):
+    """Phase 3 (vocabulary): Fine-tune on stimulus-labeled Buffi data (5-class)."""
+    print("\n" + "=" * 60)
+    print("PHASE 3 (VOCABULARY): STIMULUS RESPONSE CLASSIFICATION")
+    print("=" * 60)
+
+    all_X = []
+    all_y = []
+
+    # Load Buffi data with per-stimulus labels (0-3)
+    if os.path.exists(BUFFI_DIR):
+        print("\n  Loading Buffi data with stimulus labels...")
+        X_buffi, y_buffi = load_buffi_stimulus_labeled(BUFFI_DIR)
+        if X_buffi.shape[0] > 0:
+            all_X.append(X_buffi)
+            all_y.append(y_buffi)
+    else:
+        print(f"  Buffi dir not found: {BUFFI_DIR}")
+
+    # Add synthetic baseline as class 4
+    if os.path.exists(SYNTHETIC_DIR):
+        print("\n  Loading synthetic baseline data...")
+        X_syn, y_syn_orig = load_synthetic_data(SYNTHETIC_DIR)
+        if X_syn.shape[0] > 0:
+            # Only take inactive (label=0) synthetic windows as baseline class 4
+            baseline_mask = y_syn_orig == 0
+            X_baseline = X_syn[baseline_mask]
+            if X_baseline.shape[0] > 0:
+                y_baseline = np.full(X_baseline.shape[0], 4, dtype=int)
+                all_X.append(X_baseline)
+                all_y.append(y_baseline)
+                print(f"    Baseline (class 4): {X_baseline.shape[0]} windows")
+
+    if not all_X:
+        print("  No Phase 3 stimulus data available")
+        return None
+
+    X = np.vstack(all_X)
+    y = np.concatenate(all_y)
+
+    n_classes = len(np.unique(y))
+    print(f"\n  Combined: {X.shape[0]} windows, {n_classes} classes")
+    for c in sorted(np.unique(y)):
+        print(f"    Class {c}: {np.sum(y == c)} windows")
+
+    # Augment to balance classes
+    X, y = augment_dataset(X, y, n_augmented_per_sample=2, balance_classes=True)
+    print(f"  After augmentation: {X.shape[0]} windows")
+    log_memory("After stimulus data load + augment")
+
+    # Train/val split
+    X_train, X_val, y_train, y_val = train_test_split(
+        X, y, test_size=0.2, random_state=42, stratify=y
+    )
+    train_loader = make_loader(X_train, y_train, batch_size, num_workers=num_workers)
+    val_loader = make_loader(X_val, y_val, batch_size, shuffle=False, num_workers=num_workers)
+
+    X_val_np, y_val_np = X_val.copy(), y_val.copy()
+
+    del X, y, X_train, X_val, y_train, y_val, all_X, all_y
+    gc.collect()
+
+    # Load Phase 2 vocabulary checkpoint, or Phase 1, or fresh
+    if os.path.exists(CHECKPOINT_PHASE2_VOCAB):
+        print(f"\n  Loading Phase 2 vocabulary checkpoint: {CHECKPOINT_PHASE2_VOCAB}")
+        # Need to know K from checkpoint — load and inspect
+        state_dict = torch.load(CHECKPOINT_PHASE2_VOCAB, map_location='cpu', weights_only=True)
+        # Infer K from the last linear layer weight shape
+        phase2_k = state_dict['head.3.weight'].shape[0]
+        model = build_tcn(n_classes=phase2_k)
+        model.load_state_dict(state_dict)
+    elif os.path.exists(CHECKPOINT_PHASE1):
+        print(f"\n  No Phase 2 vocab checkpoint — loading Phase 1: {CHECKPOINT_PHASE1}")
+        model = build_tcn(n_classes=5)
+        model.load_state_dict(torch.load(CHECKPOINT_PHASE1, map_location='cpu', weights_only=True))
+    else:
+        print("\n  No prior checkpoint — starting from scratch")
+        model = build_tcn(n_classes=5)
+
+    # Replace head for stimulus classes and freeze encoder
+    model.replace_head(new_n_classes=n_classes)
+    model.freeze_encoder()
+    total, trainable = count_parameters(model)
+    print(f"  Model: {total:,} total, {trainable:,} trainable (head only)")
+    model = model.to(device)
+
+    # Train
+    best_loss, history = train_phase(
+        model, train_loader, val_loader, epochs, lr, device,
+        patience=3, phase_name="Phase3-Stimulus"
+    )
+    print(f"  Best val loss: {best_loss:.4f}")
+
+    # Save checkpoint
+    save_checkpoint(model, CHECKPOINT_PHASE3_STIMULUS)
+    log_memory("Phase 3 (stimulus) complete")
+
+    # Evaluate
+    run_evaluation_multiclass(model, X_val_np, y_val_np, device, n_classes)
+
+    return model
+
+
+def run_evaluation_multiclass(model, X_val, y_val, device, n_classes):
+    """Evaluate multi-class TCN (vocabulary or stimulus mode)."""
+    from data_loader import BUFFI_STIMULI
+
+    print("\n" + "-" * 60)
+    print("MULTI-CLASS EVALUATION")
+    print("-" * 60)
+
+    model.eval()
+    val_loader = make_loader(X_val, y_val, batch_size=64, shuffle=False)
+    all_preds = []
+    with torch.no_grad():
+        for X_batch, _ in val_loader:
+            X_batch = X_batch.to(device)
+            logits = model(X_batch)
+            all_preds.extend(logits.argmax(dim=1).cpu().numpy())
+
+    preds = np.array(all_preds)
+
+    # Build class names
+    stimulus_names = {v: k for k, v in BUFFI_STIMULI.items()}
+    class_names = []
+    for c in range(n_classes):
+        if c in stimulus_names:
+            class_names.append(stimulus_names[c])
+        elif c == 4:
+            class_names.append('baseline')
+        else:
+            class_names.append(f'class_{c}')
+
+    print(f"\n  Classification Report:")
+    print(classification_report(y_val, preds, target_names=class_names,
+                                zero_division=0))
+
+    # Per-class F1
+    from sklearn.metrics import f1_score as f1_multi
+    f1_per = f1_multi(y_val, preds, average=None, zero_division=0)
+    f1_macro = f1_multi(y_val, preds, average='macro', zero_division=0)
+    print(f"  Macro F1: {f1_macro:.4f}")
+    for i, name in enumerate(class_names):
+        if i < len(f1_per):
+            print(f"    {name}: F1={f1_per[i]:.4f}")
+
+    # Confusion matrix plot
+    os.makedirs(PLOTS_DIR, exist_ok=True)
+    fig, ax = plt.subplots(figsize=(8, 6))
+    cm = confusion_matrix(y_val, preds)
+    ConfusionMatrixDisplay(cm, display_labels=class_names).plot(
+        ax=ax, cmap='Greens'
+    )
+    ax.set_title(f'Stimulus Response Confusion Matrix (Macro F1: {f1_macro:.3f})')
+    fig.tight_layout()
+    plot_path = os.path.join(PLOTS_DIR, 'tcn_stimulus_results.png')
+    fig.savefig(plot_path, dpi=150)
+    plt.close(fig)
+    print(f"\n  Results plot saved: {plot_path}")
+
+
+# ============================================================
 # EVALUATION
 # ============================================================
 
@@ -749,7 +993,10 @@ def main():
     )
     parser.add_argument('--phase', type=str, default='all',
                         choices=['1', '2', '3', 'all'],
-                        help='Training phase (1=ECG, 2=plant+Adamatzky, 3=fine-tune, all=sequential)')
+                        help='Training phase (1=ECG, 2=adapt, 3=fine-tune, all=sequential)')
+    parser.add_argument('--mode', type=str, default='binary',
+                        choices=['binary', 'vocabulary'],
+                        help='Training mode: binary (detect activity) or vocabulary (classify word types + stimuli)')
     parser.add_argument('--evaluate', action='store_true',
                         help='Load tcn_final.pt and evaluate (skip training)')
     parser.add_argument('--full', action='store_true',
@@ -765,6 +1012,7 @@ def main():
 
     print("=" * 60)
     print("TCN 3-PHASE TRANSFER LEARNING")
+    print(f"Mode: {args.mode.upper()}")
     print("EE297B Research Project — SJSU")
     print("=" * 60)
 
@@ -775,12 +1023,12 @@ def main():
         batch_size = 64
         epochs = 20
         num_workers = 2
-        print("  Mode: Full power (Colab)")
+        print("  Power: Full (Colab)")
     else:
         batch_size = 32
         epochs = 10
         num_workers = 0
-        print("  Mode: MacBook-safe")
+        print("  Power: MacBook-safe")
 
     log_memory("Start")
 
@@ -788,31 +1036,60 @@ def main():
         run_evaluation(device=device)
         return
 
-    # Run requested phases
-    if args.phase in ('1', 'all'):
-        run_phase1(device, batch_size=batch_size, epochs=epochs, lr=1e-3,
-                   num_workers=num_workers, ecg_dir=ecg_dir)
-        gc.collect()
+    # --- BINARY MODE (original behavior) ---
+    if args.mode == 'binary':
+        if args.phase in ('1', 'all'):
+            run_phase1(device, batch_size=batch_size, epochs=epochs, lr=1e-3,
+                       num_workers=num_workers, ecg_dir=ecg_dir)
+            gc.collect()
 
-    if args.phase in ('2', 'all'):
-        run_phase2(device, batch_size=batch_size, epochs=epochs, lr=1e-4,
-                   num_workers=num_workers, plant_dir=plant_dir)
-        gc.collect()
+        if args.phase in ('2', 'all'):
+            run_phase2(device, batch_size=batch_size, epochs=epochs, lr=1e-4,
+                       num_workers=num_workers, plant_dir=plant_dir)
+            gc.collect()
 
-    if args.phase in ('3', 'all'):
-        run_phase3(device, batch_size=batch_size, epochs=epochs, lr=1e-4,
-                   num_workers=num_workers)
-        gc.collect()
+        if args.phase in ('3', 'all'):
+            run_phase3(device, batch_size=batch_size, epochs=epochs, lr=1e-4,
+                       num_workers=num_workers)
+            gc.collect()
 
-    # Final summary
-    print("\n" + "=" * 60)
-    print("TRAINING COMPLETE")
-    print("=" * 60)
-    checkpoints = [
-        ('Phase 1 (ECG)', CHECKPOINT_PHASE1),
-        ('Phase 2 (Adapted)', CHECKPOINT_PHASE2),
-        ('Phase 3 (Final)', CHECKPOINT_FINAL),
-    ]
+        # Final summary
+        print("\n" + "=" * 60)
+        print("TRAINING COMPLETE (BINARY)")
+        print("=" * 60)
+        checkpoints = [
+            ('Phase 1 (ECG)', CHECKPOINT_PHASE1),
+            ('Phase 2 (Adapted)', CHECKPOINT_PHASE2),
+            ('Phase 3 (Final)', CHECKPOINT_FINAL),
+        ]
+
+    # --- VOCABULARY MODE ---
+    elif args.mode == 'vocabulary':
+        if args.phase in ('1', 'all'):
+            run_phase1(device, batch_size=batch_size, epochs=epochs, lr=1e-3,
+                       num_workers=num_workers, ecg_dir=ecg_dir)
+            gc.collect()
+
+        if args.phase in ('2', 'all'):
+            run_phase2_vocabulary(device, batch_size=batch_size, epochs=epochs,
+                                 lr=1e-4, num_workers=num_workers)
+            gc.collect()
+
+        if args.phase in ('3', 'all'):
+            run_phase3_stimulus(device, batch_size=batch_size, epochs=epochs,
+                               lr=1e-4, num_workers=num_workers)
+            gc.collect()
+
+        # Final summary
+        print("\n" + "=" * 60)
+        print("TRAINING COMPLETE (VOCABULARY)")
+        print("=" * 60)
+        checkpoints = [
+            ('Phase 1 (ECG)', CHECKPOINT_PHASE1),
+            ('Phase 2 (Vocabulary)', CHECKPOINT_PHASE2_VOCAB),
+            ('Phase 3 (Stimulus)', CHECKPOINT_PHASE3_STIMULUS),
+        ]
+
     for name, path in checkpoints:
         if os.path.exists(path):
             size_kb = os.path.getsize(path) / 1024

@@ -307,6 +307,102 @@ def load_buffi_hdf5(filepath: str, target_rate: float = SAMPLE_RATE,
     return result
 
 
+BUFFI_STIMULI = {
+    'calcimycin': 0,
+    'cycloheximide': 1,
+    'sodiumazide': 2,
+    'voriconazole': 3,
+}
+
+
+def load_buffi_stimulus_labeled(buffi_dir: str,
+                                max_duration_sec: float = 3600.0
+                                ) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Load Buffi data with per-stimulus labels (0-3) instead of all-1.
+
+    Extracts stimulus type from filename (e.g., calcimycin.hdf5 → label 0).
+    Unknown filenames are skipped.
+
+    Returns:
+        X: 2D array of windows (n_windows, window_samples)
+        y: 1D array of stimulus labels (0-3)
+    """
+    hdf5_files = glob.glob(os.path.join(buffi_dir, '*.hdf5'))
+    hdf5_files += glob.glob(os.path.join(buffi_dir, '*.h5'))
+
+    if not hdf5_files:
+        print(f"  No HDF5 files found in {buffi_dir}")
+        return np.array([]).reshape(0, WINDOW_SAMPLES), np.array([])
+
+    all_windows = []
+    all_labels = []
+
+    for filepath in sorted(hdf5_files):
+        basename = os.path.basename(filepath).lower()
+        name_no_ext = os.path.splitext(basename)[0]
+
+        # Match filename to stimulus
+        stimulus_label = None
+        for stimulus_name, label in BUFFI_STIMULI.items():
+            if stimulus_name in name_no_ext:
+                stimulus_label = label
+                break
+
+        if stimulus_label is None:
+            print(f"    Skipping {basename} — unknown stimulus")
+            continue
+
+        print(f"  Loading {basename} → stimulus '{name_no_ext}' (label={stimulus_label})...")
+        channels = load_buffi_hdf5(filepath, max_duration_sec=max_duration_sec)
+        for channel in channels:
+            windows = segment_windows(channel)
+            if windows.shape[0] > 0:
+                all_windows.append(windows)
+                all_labels.extend([stimulus_label] * windows.shape[0])
+        if channels:
+            print(f"    {len(channels)} channels extracted")
+
+    if not all_windows:
+        return np.array([]).reshape(0, WINDOW_SAMPLES), np.array([])
+
+    X = np.vstack(all_windows)
+    y = np.array(all_labels, dtype=int)
+
+    print(f"\n  Stimulus-labeled data: {X.shape[0]} windows")
+    for stim_name, stim_label in sorted(BUFFI_STIMULI.items(), key=lambda x: x[1]):
+        count = np.sum(y == stim_label)
+        if count > 0:
+            print(f"    {stim_name} (label={stim_label}): {count} windows")
+
+    return X, y
+
+
+def load_vocabulary_labeled(cache_path: str) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Load pre-computed vocabulary-labeled windows from spike_vocabulary.py output.
+
+    Args:
+        cache_path: Path to vocabulary_labels.npz
+
+    Returns:
+        X: 2D array (n_windows, window_samples) with cluster-labeled windows
+        y: 1D array of word-type cluster IDs (0..K where K=silence)
+    """
+    if not os.path.exists(cache_path):
+        raise FileNotFoundError(
+            f"Vocabulary cache not found: {cache_path}\n"
+            f"Run: python spike_vocabulary.py  (to discover vocabulary first)"
+        )
+
+    data = np.load(cache_path)
+    X = data['X']
+    y = data['y']
+    print(f"  Loaded vocabulary-labeled data: {X.shape[0]} windows, "
+          f"{len(np.unique(y))} classes")
+    return X, y
+
+
 def load_buffi_data(buffi_dir: str) -> Tuple[np.ndarray, np.ndarray]:
     """
     Load all Buffi HDF5 files from a directory.
