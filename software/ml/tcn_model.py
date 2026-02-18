@@ -147,13 +147,70 @@ class FungalSignalTCN(nn.Module):
         self.encoder.load_state_dict(state_dict)
 
 
-def build_tcn(n_classes=2, hidden=32, kernel_size=7, num_blocks=4, dropout=0.2):
-    """Convenience factory: build a FungalSignalTCN with default architecture."""
+def build_tcn(n_classes=2, hidden=32, kernel_size=7, num_blocks=5, dropout=0.2):
+    """
+    Convenience factory: build a FungalSignalTCN with default architecture.
+
+    Default is 5 blocks (dilations [1,2,4,8,16]):
+      RF = 2 * (7-1) * (1+2+4+8+16) = 372 samples = 37 seconds at 10 Hz.
+    This gives more temporal context than the 4-block (18 sec) baseline,
+    better capturing long-duration word types (Adamatzky words span minutes).
+    """
     encoder = TCNEncoder(
         in_channels=1, hidden=hidden, kernel_size=kernel_size,
         num_blocks=num_blocks, dropout=dropout,
     )
     return FungalSignalTCN(encoder, n_classes=n_classes)
+
+
+# ============================================================
+# TCN WITH SELF-ATTENTION POOLING (Tier 2 enhancement)
+# ============================================================
+
+class TCNWithAttention(FungalSignalTCN):
+    """
+    TCN with self-attention pooling instead of global average pooling.
+
+    Learns which time steps to weight for classification, producing
+    interpretable attention maps showing which spike events drove predictions.
+
+    For a 60-second window at 10 Hz (600 samples), the model can focus
+    attention on the spike bursts most diagnostic of each stimulus.
+
+    Inherits freeze_encoder(), freeze_early_blocks(), replace_head(),
+    get_encoder_state_dict(), load_encoder_state_dict() from FungalSignalTCN.
+    """
+
+    def __init__(self, encoder, n_classes=2, num_heads=4):
+        super().__init__(encoder, n_classes)
+        hidden = encoder.hidden
+        # num_heads must divide hidden; with hidden=32, use num_heads=4
+        self.attention = nn.MultiheadAttention(
+            embed_dim=hidden, num_heads=num_heads, batch_first=True
+        )
+        self.attn_norm = nn.LayerNorm(hidden)
+
+    def forward(self, x, return_attention=False):
+        # x: (batch, 1, 600)
+        features = self.encoder(x)           # (batch, hidden, 600)
+        enc = features.permute(0, 2, 1)      # (batch, 600, hidden)
+        attn_out, attn_weights = self.attention(enc, enc, enc)
+        attn_out = self.attn_norm(attn_out + enc)  # residual + norm
+        pooled = attn_out.mean(dim=1)        # (batch, hidden) — attended avg
+        logits = self.head(pooled)
+        if return_attention:
+            return logits, attn_weights      # attn_weights: (batch, 600, 600)
+        return logits
+
+
+def build_tcn_with_attention(n_classes=2, hidden=32, kernel_size=7,
+                              num_blocks=5, dropout=0.2, num_heads=4):
+    """Build a TCNWithAttention model — interpretable attention-pooled TCN."""
+    encoder = TCNEncoder(
+        in_channels=1, hidden=hidden, kernel_size=kernel_size,
+        num_blocks=num_blocks, dropout=dropout,
+    )
+    return TCNWithAttention(encoder, n_classes=n_classes, num_heads=num_heads)
 
 
 def count_parameters(model):
@@ -164,13 +221,12 @@ def count_parameters(model):
 
 
 if __name__ == '__main__':
-    # Quick sanity check
+    # Quick sanity check — standard TCN (5-block default)
     model = build_tcn(n_classes=5)
     total, trainable = count_parameters(model)
-    print(f"TCN architecture: {total:,} total params, {trainable:,} trainable")
+    print(f"TCN (5-block): {total:,} total params, {trainable:,} trainable")
 
-    # Test forward pass
-    x = torch.randn(4, 1, 600)  # batch of 4, 1 channel, 600 samples
+    x = torch.randn(4, 1, 600)
     logits = model(x)
     print(f"Input:  {x.shape}")
     print(f"Output: {logits.shape}")
@@ -185,4 +241,14 @@ if __name__ == '__main__':
     model.freeze_encoder()
     _, trainable_head = count_parameters(model)
     print(f"After freezing encoder: {trainable_head:,} trainable (head only)")
+
+    # Sanity check — attention TCN
+    attn_model = build_tcn_with_attention(n_classes=5)
+    total_attn, _ = count_parameters(attn_model)
+    print(f"\nTCN+Attention (5-block): {total_attn:,} total params")
+    logits_attn = attn_model(x)
+    assert logits_attn.shape == (4, 5), f"Expected (4, 5), got {logits_attn.shape}"
+    logits_attn2, weights = attn_model(x, return_attention=True)
+    print(f"Attention weights shape: {weights.shape}")  # (4, 600, 600)
+
     print("All checks passed.")

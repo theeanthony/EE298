@@ -208,21 +208,32 @@ WORD_FEATURE_NAMES = [
 # ============================================================
 
 def discover_vocabulary(adamatzky_dir=ADAMATZKY_DIR, n_clusters=50,
-                        max_rows=36000, theta_multiplier=1.0):
+                        max_rows=36000, theta_multiplier=1.0,
+                        cluster_method='kmeans'):
     """
     Discover fungal signal vocabulary from Adamatzky data.
 
     Pipeline: load channels → extract spikes → group into words →
-    extract features → standardize → k-means cluster.
+    extract features → standardize → cluster into word types.
 
     Args:
-        adamatzky_dir: Path to Adamatzky .txt files
-        n_clusters: Number of word clusters (vocabulary size)
-        max_rows: Max rows per file (MacBook safety)
+        adamatzky_dir:  Path to Adamatzky .txt files
+        n_clusters:     Number of word clusters (k-means only; HDBSCAN finds k auto)
+        max_rows:       Max rows per file (MacBook safety)
         theta_multiplier: Temporal threshold multiplier
+        cluster_method: 'kmeans' (default, reproducible) or 'hdbscan'
+                        (density-based, finds k automatically, noise-robust).
+
+    HDBSCAN advantages over k-means:
+      - Discovers k automatically (no need to specify k=50 up front)
+      - Marks outlier words as noise (-1) → mapped to silence naturally
+      - Handles non-spherical clusters better (spike-train feature space
+        is not uniformly spherical)
+      - May yield 10-20 coherent types vs 50 forced k-means types
 
     Returns:
-        (scaler, kmeans, all_word_features, all_word_labels)
+        (scaler, clusterer, all_word_features, all_word_labels)
+        where clusterer is a KMeans or HDBSCAN fitted object.
     """
     import glob as globmod
 
@@ -280,19 +291,70 @@ def discover_vocabulary(adamatzky_dir=ADAMATZKY_DIR, n_clusters=50,
     scaler = StandardScaler()
     features_scaled = scaler.fit_transform(all_word_features)
 
-    # Cap k at number of words
-    actual_k = min(n_clusters, all_word_features.shape[0])
-    if actual_k < n_clusters:
-        print(f"  Capping k from {n_clusters} to {actual_k} (only {all_word_features.shape[0]} words)")
+    if cluster_method == 'hdbscan':
+        # HDBSCAN: density-based, discovers k automatically
+        try:
+            import hdbscan as hdbscan_module
+        except ImportError:
+            print("  HDBSCAN not installed. Run: pip install hdbscan")
+            print("  Falling back to k-means...")
+            cluster_method = 'kmeans'
 
-    # K-means clustering
-    print(f"  Running k-means with k={actual_k}...")
-    kmeans = KMeans(n_clusters=actual_k, random_state=42, n_init=10, max_iter=300)
-    word_labels = kmeans.fit_predict(features_scaled)
+    if cluster_method == 'hdbscan':
+        print(f"  Running HDBSCAN (min_cluster_size=5, min_samples=3)...")
+        clusterer = hdbscan_module.HDBSCAN(
+            min_cluster_size=5,
+            min_samples=3,
+            metric='euclidean',
+            cluster_selection_method='eom',
+        )
+        word_labels = clusterer.fit_predict(features_scaled)
 
-    print(f"  Vocabulary discovered: {actual_k} word types")
+        n_noise = int(np.sum(word_labels == -1))
+        n_discovered = len(set(word_labels)) - (1 if -1 in word_labels else 0)
+        print(f"  HDBSCAN discovered: {n_discovered} word types "
+              f"({n_noise} noise words → silence)")
 
-    return scaler, kmeans, all_word_features, word_labels
+        # Remap noise (-1) to max_label + 1 (acts as silence class)
+        if -1 in word_labels:
+            silence_id = int(np.max(word_labels[word_labels >= 0])) + 1
+            word_labels = np.where(word_labels == -1, silence_id, word_labels)
+            print(f"  Noise remapped to silence_id={silence_id}")
+
+        # Wrap in an object that has predict() and n_clusters for downstream compat
+        clusterer.n_clusters = n_discovered
+        clusterer._silence_id_for_noise = (
+            int(np.max(word_labels)) if n_noise > 0 else None
+        )
+        # Monkey-patch predict for HDBSCAN (approximate_predict needs training data)
+        _scaler_ref = scaler
+        _features_scaled_ref = features_scaled
+        _word_labels_ref = word_labels.copy()
+
+        def _hdbscan_predict(new_features):
+            """Nearest-neighbor predict for HDBSCAN (no native .predict)."""
+            new_scaled = _scaler_ref.transform(new_features)
+            from sklearn.metrics.pairwise import euclidean_distances
+            dists = euclidean_distances(new_scaled, _features_scaled_ref)
+            nearest_idx = np.argmin(dists, axis=1)
+            return _word_labels_ref[nearest_idx]
+
+        clusterer.predict = _hdbscan_predict
+
+    else:
+        # K-means: reproducible, fixed k
+        actual_k = min(n_clusters, all_word_features.shape[0])
+        if actual_k < n_clusters:
+            print(f"  Capping k from {n_clusters} to {actual_k} "
+                  f"(only {all_word_features.shape[0]} words)")
+
+        print(f"  Running k-means with k={actual_k}...")
+        clusterer = KMeans(n_clusters=actual_k, random_state=42,
+                           n_init=10, max_iter=300)
+        word_labels = clusterer.fit_predict(features_scaled)
+        print(f"  Vocabulary discovered: {actual_k} word types")
+
+    return scaler, clusterer, all_word_features, word_labels
 
 
 def run_elbow(adamatzky_dir=ADAMATZKY_DIR, max_k=80, step=5,
@@ -656,7 +718,13 @@ def main():
         description='Discover fungal signal vocabulary from Adamatzky data'
     )
     parser.add_argument('--n-clusters', type=int, default=50,
-                        help='Number of word clusters (default: 50)')
+                        help='Number of word clusters for k-means (default: 50). '
+                             'Ignored when --cluster-method hdbscan.')
+    parser.add_argument('--cluster-method', type=str, default='kmeans',
+                        choices=['kmeans', 'hdbscan'],
+                        help='Clustering method: kmeans (default, reproducible, fixed k) '
+                             'or hdbscan (discovers k automatically, marks noise as silence). '
+                             'Install hdbscan: pip install hdbscan')
     parser.add_argument('--theta', type=float, default=1.0,
                         help='ISI threshold multiplier (default: 1.0, Adamatzky also used 2.0)')
     parser.add_argument('--max-rows', type=int, default=36000,
@@ -668,7 +736,7 @@ def main():
     parser.add_argument('--analyze', action='store_true',
                         help='Load saved model and show vocabulary analysis')
     parser.add_argument('--elbow', action='store_true',
-                        help='Run elbow method for k selection')
+                        help='Run elbow method for k selection (k-means only)')
 
     args = parser.parse_args()
 
@@ -717,7 +785,8 @@ def main():
     import joblib
 
     print(f"\n  Parameters:")
-    print(f"    k = {args.n_clusters}")
+    print(f"    cluster method = {args.cluster_method}")
+    print(f"    k = {args.n_clusters} (k-means only)")
     print(f"    theta multiplier = {args.theta}")
     print(f"    max rows/file (Step 1) = {args.max_rows}")
     print(f"    label-max-rows (Step 3) = {args.label_max_rows}")
@@ -730,6 +799,7 @@ def main():
         n_clusters=args.n_clusters,
         max_rows=args.max_rows,
         theta_multiplier=args.theta,
+        cluster_method=args.cluster_method,
     )
 
     if kmeans is None:
@@ -740,7 +810,8 @@ def main():
     os.makedirs(MODELS_DIR, exist_ok=True)
     joblib.dump(kmeans, VOCAB_KMEANS_PATH)
     joblib.dump(scaler, VOCAB_SCALER_PATH)
-    print(f"\n  K-means saved: {VOCAB_KMEANS_PATH}")
+    method_label = args.cluster_method.upper()
+    print(f"\n  {method_label} model saved: {VOCAB_KMEANS_PATH}")
     print(f"  Scaler saved: {VOCAB_SCALER_PATH}")
 
     # Step 2: Analyze vocabulary

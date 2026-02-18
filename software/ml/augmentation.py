@@ -264,3 +264,37 @@ def augment_dataset(X: np.ndarray, y: np.ndarray,
         cursor += n_aug
 
     return X_aug, y_aug
+
+
+# ============================================================
+# MIXUP AUGMENTATION (in-batch, applied during training)
+# ============================================================
+
+def mixup_batch(X_batch, y_batch, alpha=0.2):
+    """
+    Apply Mixup augmentation to a training batch.
+
+    Creates convex combinations of pairs of windows and their labels:
+      x_mix = λ·x_i + (1-λ)·x_j
+      loss  = λ·criterion(logits, y_i) + (1-λ)·criterion(logits, y_j)
+
+    Forces the model to learn smoother decision boundaries — especially
+    useful for similar stimuli (cycloheximide ↔ sodiumazide confusion).
+
+    Args:
+        X_batch: FloatTensor (batch, 1, window_len) — input windows
+        y_batch: LongTensor (batch,) — class labels
+        alpha:   Beta distribution parameter. Higher = more mixing.
+                 alpha=0.2 gives λ mostly near 0 or 1 (mild mixing).
+
+    Returns:
+        X_mix:  Mixed input batch (same shape as X_batch)
+        y_a:    Original labels (LongTensor)
+        y_b:    Shuffled labels for the mix targets (LongTensor)
+        lam:    Scalar mixing coefficient in [0, 1]
+    """
+    import torch
+    lam = float(np.random.beta(alpha, alpha)) if alpha > 0 else 1.0
+    idx = torch.randperm(X_batch.size(0), device=X_batch.device)
+    X_mix = lam * X_batch + (1.0 - lam) * X_batch[idx]
+    return X_mix, y_batch, y_batch[idx], lam

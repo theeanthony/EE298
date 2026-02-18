@@ -36,8 +36,9 @@ import psutil
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
-from torch.optim import Adam
+from torch.optim import AdamW
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 
 from sklearn.model_selection import train_test_split
@@ -51,13 +52,13 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
 # Local imports
-from tcn_model import build_tcn, count_parameters
+from tcn_model import build_tcn, build_tcn_with_attention, count_parameters
 from data_loader import (
     load_all_data, load_adamatzky_data, load_synthetic_data,
     load_buffi_stimulus_labeled, load_vocabulary_labeled,
     segment_windows, WINDOW_SAMPLES, SAMPLE_RATE
 )
-from augmentation import augment_dataset, normalize_signal
+from augmentation import augment_dataset, normalize_signal, mixup_batch
 
 # ============================================================
 # PATHS
@@ -80,8 +81,45 @@ CHECKPOINT_PHASE2_VOCAB = os.path.join(MODELS_DIR, 'tcn_phase2_vocabulary.pt')
 CHECKPOINT_PHASE3_STIMULUS = os.path.join(MODELS_DIR, 'tcn_phase3_stimulus.pt')
 VOCAB_LABELS_PATH = os.path.join(MODELS_DIR, 'vocabulary_labels.npz')
 
+# Phase 0: plant pre-training checkpoint
+CHECKPOINT_PHASE0_PLANT = os.path.join(MODELS_DIR, 'tcn_phase0_plant.pt')
+
 # Track start time
 _t0 = time.time()
+
+
+# ============================================================
+# FOCAL LOSS (Tier 1: replaces weighted CrossEntropyLoss)
+# ============================================================
+
+class FocalLoss(nn.Module):
+    """
+    Focal Loss for imbalanced classification (Lin et al. 2017).
+
+    Down-weights *easy* examples (those the model already predicts with high
+    confidence) and concentrates gradient on hard misclassified windows.
+    Critical for the silence class (word_50 = 93% of training data) where
+    correct "silence" predictions would otherwise drown the gradient.
+
+    Loss = (1 - p_t)^gamma * CE(logits, targets)
+
+    With gamma=2.0, examples predicted with p=0.9 are down-weighted 100x
+    vs focal loss with gamma=0. CE (gamma=0) gives no such down-weighting.
+
+    Args:
+        gamma:  Focusing parameter. 0 = standard CE, 2 = standard focal loss.
+        weight: Per-class weight tensor (same as CrossEntropyLoss weight).
+    """
+
+    def __init__(self, gamma: float = 2.0, weight=None):
+        super().__init__()
+        self.gamma = gamma
+        self.weight = weight
+
+    def forward(self, logits, targets):
+        ce = F.cross_entropy(logits, targets, weight=self.weight, reduction='none')
+        pt = torch.exp(-ce)
+        return ((1.0 - pt) ** self.gamma * ce).mean()
 
 
 def log_memory(stage: str):
@@ -110,24 +148,56 @@ def get_device():
 # ============================================================
 
 def train_phase(model, train_loader, val_loader, epochs, lr, device,
-                patience=3, phase_name="", class_weights=None):
+                patience=3, phase_name="", class_weights=None,
+                use_focal=True, focal_gamma=2.0,
+                use_mixup=True, mixup_alpha=0.2,
+                warmup_epochs=2, max_grad_norm=1.0):
     """
-    Shared training loop for all 3 phases.
+    Shared training loop for all phases — with Tier 1 enhancements.
+
+    Enhancements over baseline:
+      - AdamW (weight_decay=1e-4): decouples L2 from adaptive LR,
+        reduces overfitting on sparse word-type classes.
+      - FocalLoss (gamma=2): down-weights easy examples so minority
+        word types get more gradient. Disable with use_focal=False.
+      - Gradient clipping (max_norm=1.0): prevents exploding gradients
+        during Phase 2 with many imbalanced classes.
+      - LR warmup (first warmup_epochs): linearly ramps LR from
+        lr/warmup_steps to lr per step — avoids corrupting pre-trained
+        weights with large early updates.
+      - Mixup (alpha=0.2): convex batch combinations smooth decision
+        boundaries between similar stimuli. Disable with use_mixup=False.
 
     Args:
-        class_weights: Optional FloatTensor of per-class weights for
-                       CrossEntropyLoss. Pass to handle imbalanced classes
-                       without memory-intensive oversampling.
+        class_weights: Optional FloatTensor of per-class weights.
+        use_focal:     If True, use FocalLoss; else CrossEntropyLoss.
+        focal_gamma:   Focusing exponent for FocalLoss (default 2.0).
+        use_mixup:     If True, apply Mixup to each training batch.
+        mixup_alpha:   Beta distribution parameter for Mixup (0.2 = mild).
+        warmup_epochs: Number of epochs for linear LR warmup.
+        max_grad_norm: Gradient clipping threshold (0 = disabled).
 
     Returns:
         best_val_loss: Best validation loss achieved
         history: Dict of training metrics per epoch
     """
-    optimizer = Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=lr)
+    optimizer = AdamW(
+        filter(lambda p: p.requires_grad, model.parameters()),
+        lr=lr, weight_decay=1e-4
+    )
     scheduler = ReduceLROnPlateau(optimizer, mode='min', patience=2, factor=0.5)
-    criterion = nn.CrossEntropyLoss(weight=class_weights)
+
+    if use_focal:
+        criterion = FocalLoss(gamma=focal_gamma, weight=class_weights)
+    else:
+        criterion = nn.CrossEntropyLoss(weight=class_weights)
+
+    # Pre-compute warmup schedule (step-based, linear ramp)
+    total_warmup_steps = warmup_epochs * max(len(train_loader), 1)
+    step_count = 0
 
     best_val_loss = float('inf')
+    best_state = None
     patience_counter = 0
     history = {'train_loss': [], 'val_loss': [], 'val_acc': []}
 
@@ -136,15 +206,36 @@ def train_phase(model, train_loader, val_loader, epochs, lr, device,
         model.train()
         train_loss = 0.0
         n_batches = 0
+
         for X_batch, y_batch in train_loader:
             X_batch = X_batch.to(device)
             y_batch = y_batch.to(device)
 
+            # LR warmup: linearly ramp from 0 → lr over total_warmup_steps
+            if total_warmup_steps > 0 and step_count < total_warmup_steps:
+                warmup_factor = (step_count + 1) / total_warmup_steps
+                for pg in optimizer.param_groups:
+                    pg['lr'] = lr * warmup_factor
+
             optimizer.zero_grad()
-            logits = model(X_batch)
-            loss = criterion(logits, y_batch)
+
+            # Mixup augmentation (on-device, no extra memory allocation)
+            if use_mixup and model.training:
+                X_mix, y_a, y_b, lam = mixup_batch(X_batch, y_batch,
+                                                     alpha=mixup_alpha)
+                logits = model(X_mix)
+                loss = lam * criterion(logits, y_a) + (1.0 - lam) * criterion(logits, y_b)
+            else:
+                logits = model(X_batch)
+                loss = criterion(logits, y_batch)
+
             loss.backward()
+
+            if max_grad_norm > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+
             optimizer.step()
+            step_count += 1
 
             train_loss += loss.item()
             n_batches += 1
@@ -153,7 +244,10 @@ def train_phase(model, train_loader, val_loader, epochs, lr, device,
 
         # --- Validate ---
         val_loss, val_acc = evaluate_model(model, val_loader, criterion, device)
-        scheduler.step(val_loss)
+
+        # ReduceLROnPlateau kicks in after warmup completes
+        if step_count >= total_warmup_steps:
+            scheduler.step(val_loss)
 
         history['train_loss'].append(train_loss)
         history['val_loss'].append(val_loss)
@@ -168,7 +262,6 @@ def train_phase(model, train_loader, val_loader, epochs, lr, device,
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             patience_counter = 0
-            # Save best model in memory (will checkpoint after loop)
             best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
         else:
             patience_counter += 1
@@ -179,7 +272,7 @@ def train_phase(model, train_loader, val_loader, epochs, lr, device,
         log_memory(f"{phase_name} epoch {epoch+1}")
 
     # Restore best weights
-    if best_state:
+    if best_state is not None:
         model.load_state_dict(best_state)
 
     return best_val_loss, history
@@ -222,6 +315,86 @@ def make_loader(X, y, batch_size, shuffle=True, num_workers=0):
     dataset = TensorDataset(X_tensor, y_tensor)
     return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle,
                       num_workers=num_workers, pin_memory=False)
+
+
+# ============================================================
+# PHASE 0: PRE-TRAIN ON PLANT ELECTROPHYSIOLOGY (Tier 2)
+# ============================================================
+
+def run_phase0_plant(device, batch_size=32, epochs=10, lr=1e-3, num_workers=0,
+                     plant_dir=None, use_focal=True, use_mixup=True,
+                     warmup_epochs=2, num_blocks=5, use_attention=False):
+    """
+    Phase 0: Pre-train on plant electrophysiology data (binary: AP spike vs silence).
+
+    Scientific rationale: plant action potentials share key properties with fungal
+    signals — both are slow (0.01-1 Hz), bioelectrical, and aperiodic — making plant
+    data much closer to the target domain than ECG heartbeats.
+
+    Paper angle: "Cross-kingdom transfer learning — pre-training on vascular plant
+    action potentials improves fungal signal classification."
+
+    Data: .wav files at ~10 kHz in data/external/plant_electrophys/
+    If missing, place Mancuso-lab style AP recordings there.
+    Phase 1 (ECG) will automatically load this encoder as its starting point.
+    """
+    if plant_dir is None:
+        plant_dir = PLANT_DIR
+
+    print("\n" + "=" * 60)
+    print("PHASE 0: PRE-TRAIN ON PLANT ELECTROPHYSIOLOGY")
+    print("=" * 60)
+
+    print("\n  Loading plant electrophysiology data...")
+    X, y = load_plant_data(plant_dir)
+
+    if X is None or X.shape[0] == 0:
+        print("  No plant data found — skipping Phase 0")
+        print(f"  (Place plant .wav recordings in: {plant_dir})")
+        return None
+
+    print(f"  Plant: {X.shape[0]} windows "
+          f"(label 0: {np.sum(y == 0)}, label 1: {np.sum(y == 1)})")
+    log_memory("After Phase 0 plant data load")
+
+    # Augment and balance
+    X, y = augment_dataset(X, y, n_augmented_per_sample=2, balance_classes=True)
+    print(f"  After augmentation: {X.shape[0]} windows "
+          f"(label 0: {np.sum(y == 0)}, label 1: {np.sum(y == 1)})")
+    log_memory("After Phase 0 augment")
+
+    X_train, X_val, y_train, y_val = train_test_split(
+        X, y, test_size=0.2, random_state=42, stratify=y
+    )
+    train_loader = make_loader(X_train, y_train, batch_size, num_workers=num_workers)
+    val_loader = make_loader(X_val, y_val, batch_size, shuffle=False,
+                             num_workers=num_workers)
+
+    del X, y, X_train, X_val, y_train, y_val
+    gc.collect()
+
+    # Build fresh 2-class model
+    if use_attention:
+        model = build_tcn_with_attention(n_classes=2, num_blocks=num_blocks)
+    else:
+        model = build_tcn(n_classes=2, num_blocks=num_blocks)
+
+    total, trainable = count_parameters(model)
+    print(f"  Model: {total:,} total params, {trainable:,} trainable")
+    model = model.to(device)
+
+    best_loss, history = train_phase(
+        model, train_loader, val_loader, epochs, lr, device,
+        patience=3, phase_name="Phase0-Plant",
+        use_focal=use_focal, use_mixup=use_mixup,
+        warmup_epochs=warmup_epochs,
+    )
+    print(f"  Best val loss: {best_loss:.4f}")
+
+    save_checkpoint(model, CHECKPOINT_PHASE0_PLANT)
+    log_memory("Phase 0 complete")
+
+    return model
 
 
 # ============================================================
@@ -305,8 +478,12 @@ def load_ecg_data(ecg_dir):
     return X, y
 
 
-def run_phase1(device, batch_size=32, epochs=10, lr=1e-3, num_workers=0, ecg_dir=None):
-    """Phase 1: Pre-train on ECG heartbeat data (5-class)."""
+def run_phase1(device, batch_size=32, epochs=10, lr=1e-3, num_workers=0,
+               ecg_dir=None, use_focal=True, use_mixup=True,
+               warmup_epochs=2, num_blocks=5, use_attention=False):
+    """Phase 1: Pre-train on ECG heartbeat data (5-class).
+    Loads Phase 0 (plant) encoder as starting point if checkpoint exists.
+    """
     if ecg_dir is None:
         ecg_dir = ECG_DIR
     print("\n" + "=" * 60)
@@ -332,26 +509,47 @@ def run_phase1(device, batch_size=32, epochs=10, lr=1e-3, num_workers=0, ecg_dir
     print(f"  Train: {X_train.shape[0]}, Val: {X_val.shape[0]}")
 
     train_loader = make_loader(X_train, y_train, batch_size, num_workers=num_workers)
-    val_loader = make_loader(X_val, y_val, batch_size, shuffle=False, num_workers=num_workers)
+    val_loader = make_loader(X_val, y_val, batch_size, shuffle=False,
+                             num_workers=num_workers)
 
-    # Free numpy arrays
     del X, y, X_train, X_val, y_train, y_val
     gc.collect()
 
     # Build fresh 5-class model
-    model = build_tcn(n_classes=5)
+    if use_attention:
+        model = build_tcn_with_attention(n_classes=5, num_blocks=num_blocks)
+    else:
+        model = build_tcn(n_classes=5, num_blocks=num_blocks)
+
+    # Load Phase 0 (plant) encoder as starting point if available
+    # Cross-kingdom transfer: plant APs → ECG features → fungal domain
+    if os.path.exists(CHECKPOINT_PHASE0_PLANT):
+        print(f"\n  Loading Phase 0 (plant) encoder: {CHECKPOINT_PHASE0_PLANT}")
+        phase0_model = (build_tcn_with_attention(n_classes=2, num_blocks=num_blocks)
+                        if use_attention
+                        else build_tcn(n_classes=2, num_blocks=num_blocks))
+        phase0_state = torch.load(CHECKPOINT_PHASE0_PLANT, map_location='cpu',
+                                  weights_only=True)
+        phase0_model.load_state_dict(phase0_state, strict=False)
+        model.load_encoder_state_dict(phase0_model.get_encoder_state_dict())
+        del phase0_model, phase0_state
+        gc.collect()
+        print("  Plant pre-training encoder transferred to Phase 1 (cross-kingdom transfer)")
+    else:
+        print("\n  No Phase 0 plant checkpoint — Phase 1 starts from scratch")
+
     total, trainable = count_parameters(model)
     print(f"  Model: {total:,} total params, {trainable:,} trainable")
     model = model.to(device)
 
-    # Train
     best_loss, history = train_phase(
         model, train_loader, val_loader, epochs, lr, device,
-        patience=3, phase_name="Phase1"
+        patience=3, phase_name="Phase1",
+        use_focal=use_focal, use_mixup=use_mixup,
+        warmup_epochs=warmup_epochs,
     )
     print(f"  Best val loss: {best_loss:.4f}")
 
-    # Save checkpoint
     save_checkpoint(model, CHECKPOINT_PHASE1)
     log_memory("Phase 1 complete")
 
@@ -468,7 +666,9 @@ def load_plant_data(plant_dir):
     return X, y
 
 
-def run_phase2(device, batch_size=32, epochs=10, lr=1e-4, num_workers=0, plant_dir=None):
+def run_phase2(device, batch_size=32, epochs=10, lr=1e-4, num_workers=0,
+               plant_dir=None, use_focal=True, use_mixup=True,
+               warmup_epochs=2, num_blocks=5, use_attention=False):
     """Phase 2: Domain-adapt on plant + Adamatzky data (2-class)."""
     if plant_dir is None:
         plant_dir = PLANT_DIR
@@ -525,10 +725,17 @@ def run_phase2(device, batch_size=32, epochs=10, lr=1e-4, num_workers=0, plant_d
     gc.collect()
 
     # Load Phase 1 checkpoint or build fresh
-    model = build_tcn(n_classes=5)  # start with Phase 1 architecture
+    if use_attention:
+        model = build_tcn_with_attention(n_classes=5, num_blocks=num_blocks)
+    else:
+        model = build_tcn(n_classes=5, num_blocks=num_blocks)
+
     if os.path.exists(CHECKPOINT_PHASE1):
         print(f"\n  Loading Phase 1 checkpoint: {CHECKPOINT_PHASE1}")
-        model.load_state_dict(torch.load(CHECKPOINT_PHASE1, map_location='cpu', weights_only=True))
+        model.load_state_dict(
+            torch.load(CHECKPOINT_PHASE1, map_location='cpu', weights_only=True),
+            strict=not use_attention  # attention layers missing from ECG checkpoint
+        )
     else:
         print("\n  No Phase 1 checkpoint found — starting from scratch")
 
@@ -536,17 +743,17 @@ def run_phase2(device, batch_size=32, epochs=10, lr=1e-4, num_workers=0, plant_d
     model.replace_head(new_n_classes=2)
     model.freeze_early_blocks(n=2)
     total, trainable = count_parameters(model)
-    print(f"  Model: {total:,} total, {trainable:,} trainable (blocks 3-4 + head)")
+    print(f"  Model: {total:,} total, {trainable:,} trainable (later blocks + head)")
     model = model.to(device)
 
-    # Train
     best_loss, history = train_phase(
         model, train_loader, val_loader, epochs, lr, device,
-        patience=3, phase_name="Phase2"
+        patience=3, phase_name="Phase2",
+        use_focal=use_focal, use_mixup=use_mixup,
+        warmup_epochs=warmup_epochs,
     )
     print(f"  Best val loss: {best_loss:.4f}")
 
-    # Save checkpoint
     save_checkpoint(model, CHECKPOINT_PHASE2)
     log_memory("Phase 2 complete")
 
@@ -557,7 +764,9 @@ def run_phase2(device, batch_size=32, epochs=10, lr=1e-4, num_workers=0, plant_d
 # PHASE 3: FINE-TUNE ON TARGET DATA
 # ============================================================
 
-def run_phase3(device, batch_size=32, epochs=10, lr=1e-4, num_workers=0):
+def run_phase3(device, batch_size=32, epochs=10, lr=1e-4, num_workers=0,
+               use_focal=True, use_mixup=True, warmup_epochs=2,
+               num_blocks=5, use_attention=False):
     """Phase 3: Fine-tune on Buffi + synthetic fungal data (2-class)."""
     print("\n" + "=" * 60)
     print("PHASE 3: FINE-TUNE ON TARGET FUNGAL DATA")
@@ -596,33 +805,43 @@ def run_phase3(device, batch_size=32, epochs=10, lr=1e-4, num_workers=0):
     gc.collect()
 
     # Load Phase 2 checkpoint or Phase 1 or fresh
-    model = build_tcn(n_classes=2)
+    if use_attention:
+        model = build_tcn_with_attention(n_classes=2, num_blocks=num_blocks)
+    else:
+        model = build_tcn(n_classes=2, num_blocks=num_blocks)
+
     if os.path.exists(CHECKPOINT_PHASE2):
         print(f"\n  Loading Phase 2 checkpoint: {CHECKPOINT_PHASE2}")
-        model.load_state_dict(torch.load(CHECKPOINT_PHASE2, map_location='cpu', weights_only=True))
+        model.load_state_dict(
+            torch.load(CHECKPOINT_PHASE2, map_location='cpu', weights_only=True),
+            strict=not use_attention
+        )
     elif os.path.exists(CHECKPOINT_PHASE1):
         print(f"\n  No Phase 2 checkpoint — loading Phase 1: {CHECKPOINT_PHASE1}")
-        phase1_model = build_tcn(n_classes=5)
-        phase1_model.load_state_dict(torch.load(CHECKPOINT_PHASE1, map_location='cpu', weights_only=True))
-        model.load_encoder_state_dict(phase1_model.get_encoder_state_dict())
-        del phase1_model
+        src = (build_tcn_with_attention(n_classes=5, num_blocks=num_blocks)
+               if use_attention else build_tcn(n_classes=5, num_blocks=num_blocks))
+        src.load_state_dict(
+            torch.load(CHECKPOINT_PHASE1, map_location='cpu', weights_only=True),
+            strict=not use_attention
+        )
+        model.load_encoder_state_dict(src.get_encoder_state_dict())
+        del src
     else:
         print("\n  No prior checkpoint — starting from scratch")
 
-    # Freeze encoder, train head only
     model.freeze_encoder()
     total, trainable = count_parameters(model)
     print(f"  Model: {total:,} total, {trainable:,} trainable (head only)")
     model = model.to(device)
 
-    # Train
     best_loss, history = train_phase(
         model, train_loader, val_loader, epochs, lr, device,
-        patience=3, phase_name="Phase3"
+        patience=3, phase_name="Phase3",
+        use_focal=use_focal, use_mixup=use_mixup,
+        warmup_epochs=warmup_epochs,
     )
     print(f"  Best val loss: {best_loss:.4f}")
 
-    # Save final model
     save_checkpoint(model, CHECKPOINT_FINAL)
     log_memory("Phase 3 complete")
 
@@ -636,7 +855,9 @@ def run_phase3(device, batch_size=32, epochs=10, lr=1e-4, num_workers=0):
 # VOCABULARY MODE — PHASE 2: VOCABULARY CLASSIFICATION
 # ============================================================
 
-def run_phase2_vocabulary(device, batch_size=32, epochs=10, lr=1e-4, num_workers=0):
+def run_phase2_vocabulary(device, batch_size=32, epochs=10, lr=1e-4, num_workers=0,
+                          use_focal=True, use_mixup=True, warmup_epochs=2,
+                          num_blocks=5, use_attention=False):
     """Phase 2 (vocabulary): Train on k-class vocabulary labels from spike clustering."""
     print("\n" + "=" * 60)
     print("PHASE 2 (VOCABULARY): CLASSIFY SPIKE WORD TYPES")
@@ -685,10 +906,17 @@ def run_phase2_vocabulary(device, batch_size=32, epochs=10, lr=1e-4, num_workers
     gc.collect()
 
     # Load Phase 1 checkpoint or build fresh
-    model = build_tcn(n_classes=5)
+    if use_attention:
+        model = build_tcn_with_attention(n_classes=5, num_blocks=num_blocks)
+    else:
+        model = build_tcn(n_classes=5, num_blocks=num_blocks)
+
     if os.path.exists(CHECKPOINT_PHASE1):
         print(f"\n  Loading Phase 1 checkpoint: {CHECKPOINT_PHASE1}")
-        model.load_state_dict(torch.load(CHECKPOINT_PHASE1, map_location='cpu', weights_only=True))
+        model.load_state_dict(
+            torch.load(CHECKPOINT_PHASE1, map_location='cpu', weights_only=True),
+            strict=not use_attention
+        )
     else:
         print("\n  No Phase 1 checkpoint — starting from scratch")
 
@@ -696,17 +924,19 @@ def run_phase2_vocabulary(device, batch_size=32, epochs=10, lr=1e-4, num_workers
     model.replace_head(new_n_classes=K)
     model.freeze_early_blocks(n=2)
     total, trainable = count_parameters(model)
-    print(f"  Model: {total:,} total, {trainable:,} trainable (blocks 3-4 + head)")
+    print(f"  Model: {total:,} total, {trainable:,} trainable (later blocks + head)")
     model = model.to(device)
 
-    # Train with weighted loss to counter class imbalance
+    # FocalLoss + class_weights: focal handles intra-class hard examples,
+    # class_weights handles inter-class Zipfian imbalance (silence vs. rare words).
     best_loss, history = train_phase(
         model, train_loader, val_loader, epochs, lr, device,
-        patience=3, phase_name="Phase2-Vocab", class_weights=class_weights
+        patience=3, phase_name="Phase2-Vocab", class_weights=class_weights,
+        use_focal=use_focal, use_mixup=use_mixup,
+        warmup_epochs=warmup_epochs,
     )
     print(f"  Best val loss: {best_loss:.4f}")
 
-    # Save checkpoint
     save_checkpoint(model, CHECKPOINT_PHASE2_VOCAB)
     log_memory("Phase 2 (vocabulary) complete")
 
@@ -717,7 +947,9 @@ def run_phase2_vocabulary(device, batch_size=32, epochs=10, lr=1e-4, num_workers
 # VOCABULARY MODE — PHASE 3: STIMULUS RESPONSE
 # ============================================================
 
-def run_phase3_stimulus(device, batch_size=32, epochs=10, lr=1e-4, num_workers=0):
+def run_phase3_stimulus(device, batch_size=32, epochs=10, lr=1e-4, num_workers=0,
+                        use_focal=True, use_mixup=True, warmup_epochs=2,
+                        num_blocks=5, use_attention=False):
     """Phase 3 (vocabulary): Fine-tune on stimulus-labeled Buffi data (5-class)."""
     print("\n" + "=" * 60)
     print("PHASE 3 (VOCABULARY): STIMULUS RESPONSE CLASSIFICATION")
@@ -782,19 +1014,30 @@ def run_phase3_stimulus(device, batch_size=32, epochs=10, lr=1e-4, num_workers=0
     # Load Phase 2 vocabulary checkpoint, or Phase 1, or fresh
     if os.path.exists(CHECKPOINT_PHASE2_VOCAB):
         print(f"\n  Loading Phase 2 vocabulary checkpoint: {CHECKPOINT_PHASE2_VOCAB}")
-        # Need to know K from checkpoint — load and inspect
         state_dict = torch.load(CHECKPOINT_PHASE2_VOCAB, map_location='cpu', weights_only=True)
-        # Infer K from the last linear layer weight shape
+        # Infer K from last linear layer weight shape
         phase2_k = state_dict['head.3.weight'].shape[0]
-        model = build_tcn(n_classes=phase2_k)
-        model.load_state_dict(state_dict)
+        if use_attention:
+            model = build_tcn_with_attention(n_classes=phase2_k, num_blocks=num_blocks)
+        else:
+            model = build_tcn(n_classes=phase2_k, num_blocks=num_blocks)
+        model.load_state_dict(state_dict, strict=not use_attention)
     elif os.path.exists(CHECKPOINT_PHASE1):
         print(f"\n  No Phase 2 vocab checkpoint — loading Phase 1: {CHECKPOINT_PHASE1}")
-        model = build_tcn(n_classes=5)
-        model.load_state_dict(torch.load(CHECKPOINT_PHASE1, map_location='cpu', weights_only=True))
+        if use_attention:
+            model = build_tcn_with_attention(n_classes=5, num_blocks=num_blocks)
+        else:
+            model = build_tcn(n_classes=5, num_blocks=num_blocks)
+        model.load_state_dict(
+            torch.load(CHECKPOINT_PHASE1, map_location='cpu', weights_only=True),
+            strict=not use_attention
+        )
     else:
         print("\n  No prior checkpoint — starting from scratch")
-        model = build_tcn(n_classes=5)
+        if use_attention:
+            model = build_tcn_with_attention(n_classes=5, num_blocks=num_blocks)
+        else:
+            model = build_tcn(n_classes=5, num_blocks=num_blocks)
 
     # Replace head for stimulus classes and freeze encoder
     model.replace_head(new_n_classes=n_classes)
@@ -803,14 +1046,16 @@ def run_phase3_stimulus(device, batch_size=32, epochs=10, lr=1e-4, num_workers=0
     print(f"  Model: {total:,} total, {trainable:,} trainable (head only)")
     model = model.to(device)
 
-    # Train
+    # Mixup between stimulus classes is most impactful here:
+    # cycloheximide ↔ sodiumazide confusion should decrease.
     best_loss, history = train_phase(
         model, train_loader, val_loader, epochs, lr, device,
-        patience=3, phase_name="Phase3-Stimulus"
+        patience=3, phase_name="Phase3-Stimulus",
+        use_focal=use_focal, use_mixup=use_mixup,
+        warmup_epochs=warmup_epochs,
     )
     print(f"  Best val loss: {best_loss:.4f}")
 
-    # Save checkpoint
     save_checkpoint(model, CHECKPOINT_PHASE3_STIMULUS)
     log_memory("Phase 3 (stimulus) complete")
 
@@ -1010,30 +1255,57 @@ def main():
     _t0 = time.time()
 
     parser = argparse.ArgumentParser(
-        description='TCN 3-phase transfer learning for fungal signal classification'
+        description='TCN transfer learning for fungal signal classification'
     )
     parser.add_argument('--phase', type=str, default='all',
-                        choices=['1', '2', '3', 'all'],
-                        help='Training phase (1=ECG, 2=adapt, 3=fine-tune, all=sequential)')
+                        choices=['0', '1', '2', '3', 'all'],
+                        help='Phase: 0=plant pre-train, 1=ECG, 2=adapt, 3=fine-tune, all=sequential')
     parser.add_argument('--mode', type=str, default='binary',
                         choices=['binary', 'vocabulary'],
-                        help='Training mode: binary (detect activity) or vocabulary (classify word types + stimuli)')
+                        help='binary: detect activity | vocabulary: classify word types + stimuli')
     parser.add_argument('--evaluate', action='store_true',
                         help='Load tcn_final.pt and evaluate (skip training)')
     parser.add_argument('--full', action='store_true',
                         help='Colab mode: bigger batch, more epochs')
+
+    # Architecture flags
+    parser.add_argument('--num-blocks', type=int, default=5,
+                        help='Number of TCN dilated blocks (default: 5, RF=37s). '
+                             'Use 4 to reproduce baseline (RF=18s).')
+    parser.add_argument('--attention', action='store_true',
+                        help='Use self-attention pooling instead of global average pool. '
+                             'Adds ~3k params; produces interpretable attention maps.')
+
+    # Loss and optimizer flags
+    parser.add_argument('--no-focal-loss', action='store_true',
+                        help='Use CrossEntropyLoss instead of FocalLoss (disables Tier 1 focal)')
+    parser.add_argument('--no-mixup', action='store_true',
+                        help='Disable Mixup batch augmentation (disables Tier 1 mixup)')
+    parser.add_argument('--warmup-epochs', type=int, default=2,
+                        help='LR warmup epochs (0 = disabled). Default 2.')
+
+    # Data paths
     parser.add_argument('--ecg-dir', type=str, default=ECG_DIR)
     parser.add_argument('--plant-dir', type=str, default=PLANT_DIR)
 
     args = parser.parse_args()
 
-    # Update module-level dir paths from CLI args
     ecg_dir = args.ecg_dir
     plant_dir = args.plant_dir
+    use_focal = not args.no_focal_loss
+    use_mixup = not args.no_mixup
+    warmup_epochs = args.warmup_epochs
+    num_blocks = args.num_blocks
+    use_attention = args.attention
 
     print("=" * 60)
-    print("TCN 3-PHASE TRANSFER LEARNING")
+    print("TCN TRANSFER LEARNING — ENHANCED PIPELINE")
     print(f"Mode: {args.mode.upper()}")
+    print(f"Arch: {num_blocks}-block TCN"
+          f"{' + Attention' if use_attention else ''}"
+          f" | FocalLoss: {use_focal}"
+          f" | Mixup: {use_mixup}"
+          f" | Warmup: {warmup_epochs} epochs")
     print("EE297B Research Project — SJSU")
     print("=" * 60)
 
@@ -1057,28 +1329,36 @@ def main():
         run_evaluation(device=device)
         return
 
-    # --- BINARY MODE (original behavior) ---
+    # Shared kwargs passed to all run_phase* functions
+    phase_kw = dict(
+        batch_size=batch_size, epochs=epochs, num_workers=num_workers,
+        use_focal=use_focal, use_mixup=use_mixup, warmup_epochs=warmup_epochs,
+        num_blocks=num_blocks, use_attention=use_attention,
+    )
+
+    # --- BINARY MODE ---
     if args.mode == 'binary':
+        if args.phase in ('0', 'all'):
+            run_phase0_plant(device, lr=1e-3, plant_dir=plant_dir, **phase_kw)
+            gc.collect()
+
         if args.phase in ('1', 'all'):
-            run_phase1(device, batch_size=batch_size, epochs=epochs, lr=1e-3,
-                       num_workers=num_workers, ecg_dir=ecg_dir)
+            run_phase1(device, lr=1e-3, ecg_dir=ecg_dir, **phase_kw)
             gc.collect()
 
         if args.phase in ('2', 'all'):
-            run_phase2(device, batch_size=batch_size, epochs=epochs, lr=1e-4,
-                       num_workers=num_workers, plant_dir=plant_dir)
+            run_phase2(device, lr=1e-4, plant_dir=plant_dir, **phase_kw)
             gc.collect()
 
         if args.phase in ('3', 'all'):
-            run_phase3(device, batch_size=batch_size, epochs=epochs, lr=1e-4,
-                       num_workers=num_workers)
+            run_phase3(device, lr=1e-4, **phase_kw)
             gc.collect()
 
-        # Final summary
         print("\n" + "=" * 60)
         print("TRAINING COMPLETE (BINARY)")
         print("=" * 60)
         checkpoints = [
+            ('Phase 0 (Plant)', CHECKPOINT_PHASE0_PLANT),
             ('Phase 1 (ECG)', CHECKPOINT_PHASE1),
             ('Phase 2 (Adapted)', CHECKPOINT_PHASE2),
             ('Phase 3 (Final)', CHECKPOINT_FINAL),
@@ -1086,26 +1366,27 @@ def main():
 
     # --- VOCABULARY MODE ---
     elif args.mode == 'vocabulary':
+        if args.phase in ('0', 'all'):
+            run_phase0_plant(device, lr=1e-3, plant_dir=plant_dir, **phase_kw)
+            gc.collect()
+
         if args.phase in ('1', 'all'):
-            run_phase1(device, batch_size=batch_size, epochs=epochs, lr=1e-3,
-                       num_workers=num_workers, ecg_dir=ecg_dir)
+            run_phase1(device, lr=1e-3, ecg_dir=ecg_dir, **phase_kw)
             gc.collect()
 
         if args.phase in ('2', 'all'):
-            run_phase2_vocabulary(device, batch_size=batch_size, epochs=epochs,
-                                 lr=1e-4, num_workers=num_workers)
+            run_phase2_vocabulary(device, lr=1e-4, **phase_kw)
             gc.collect()
 
         if args.phase in ('3', 'all'):
-            run_phase3_stimulus(device, batch_size=batch_size, epochs=epochs,
-                               lr=1e-4, num_workers=num_workers)
+            run_phase3_stimulus(device, lr=1e-4, **phase_kw)
             gc.collect()
 
-        # Final summary
         print("\n" + "=" * 60)
         print("TRAINING COMPLETE (VOCABULARY)")
         print("=" * 60)
         checkpoints = [
+            ('Phase 0 (Plant)', CHECKPOINT_PHASE0_PLANT),
             ('Phase 1 (ECG)', CHECKPOINT_PHASE1),
             ('Phase 2 (Vocabulary)', CHECKPOINT_PHASE2_VOCAB),
             ('Phase 3 (Stimulus)', CHECKPOINT_PHASE3_STIMULUS),
