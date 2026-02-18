@@ -424,7 +424,8 @@ def label_windows_by_vocabulary(signal, words, word_labels,
 # ============================================================
 
 def build_labeled_dataset(adamatzky_dir=ADAMATZKY_DIR, kmeans=None,
-                          scaler=None, max_rows=36000, theta_multiplier=1.0):
+                          scaler=None, max_rows=36000, theta_multiplier=1.0,
+                          max_total_windows=100000):
     """
     Build vocabulary-labeled windows for TCN Phase 2 training.
 
@@ -437,6 +438,8 @@ def build_labeled_dataset(adamatzky_dir=ADAMATZKY_DIR, kmeans=None,
         scaler: Fitted StandardScaler
         max_rows: Max rows per file
         theta_multiplier: Temporal threshold multiplier
+        max_total_windows: Cap on total windows collected (0 = unlimited).
+                           Default 100,000 keeps memory under ~250 MB.
 
     Returns:
         X: 2D array (n_windows, 600)
@@ -454,6 +457,7 @@ def build_labeled_dataset(adamatzky_dir=ADAMATZKY_DIR, kmeans=None,
 
     all_windows = []
     all_labels = []
+    capped = False
 
     for filepath in sorted(txt_files):
         channels = load_adamatzky_txt(filepath, max_rows=max_rows)
@@ -485,8 +489,13 @@ def build_labeled_dataset(adamatzky_dir=ADAMATZKY_DIR, kmeans=None,
                 all_windows.append(windows)
                 all_labels.extend(labels)
 
-        print(f"    {os.path.basename(filepath)}: "
-              f"{sum(w.shape[0] for w in all_windows)} windows so far")
+        total_so_far = sum(w.shape[0] for w in all_windows)
+        print(f"    {os.path.basename(filepath)}: {total_so_far} windows so far")
+
+        if max_total_windows > 0 and total_so_far >= max_total_windows:
+            print(f"  Window cap reached ({max_total_windows:,}), stopping early")
+            capped = True
+            break
 
     if not all_windows:
         return np.array([]).reshape(0, WINDOW_SAMPLES), np.array([], dtype=int)
