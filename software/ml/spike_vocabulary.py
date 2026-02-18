@@ -425,7 +425,7 @@ def label_windows_by_vocabulary(signal, words, word_labels,
 
 def build_labeled_dataset(adamatzky_dir=ADAMATZKY_DIR, kmeans=None,
                           scaler=None, max_rows=36000, theta_multiplier=1.0,
-                          max_total_windows=100000):
+                          max_total_windows=50000):
     """
     Build vocabulary-labeled windows for TCN Phase 2 training.
 
@@ -439,7 +439,8 @@ def build_labeled_dataset(adamatzky_dir=ADAMATZKY_DIR, kmeans=None,
         max_rows: Max rows per file
         theta_multiplier: Temporal threshold multiplier
         max_total_windows: Cap on total windows collected (0 = unlimited).
-                           Default 100,000 keeps memory under ~250 MB.
+                           Default 50,000 — after 2x augmentation stays ~150k,
+                           keeping peak memory under ~400 MB on Colab.
 
     Returns:
         X: 2D array (n_windows, 600)
@@ -460,6 +461,8 @@ def build_labeled_dataset(adamatzky_dir=ADAMATZKY_DIR, kmeans=None,
     capped = False
 
     for filepath in sorted(txt_files):
+        if capped:
+            break
         channels = load_adamatzky_txt(filepath, max_rows=max_rows)
 
         for channel in channels:
@@ -471,31 +474,34 @@ def build_labeled_dataset(adamatzky_dir=ADAMATZKY_DIR, kmeans=None,
                 if windows.shape[0] > 0:
                     all_windows.append(windows)
                     all_labels.extend([silence_label] * windows.shape[0])
-                continue
+            else:
+                words = group_spikes_into_words(spikes, theta_multiplier)
 
-            words = group_spikes_into_words(spikes, theta_multiplier)
+                # Get per-word features and cluster labels
+                word_features = np.array([extract_word_features(w) for w in words])
+                features_scaled = scaler.transform(word_features)
+                word_labels = kmeans.predict(features_scaled)
 
-            # Get per-word features and cluster labels
-            word_features = np.array([extract_word_features(w) for w in words])
-            features_scaled = scaler.transform(word_features)
-            word_labels = kmeans.predict(features_scaled)
+                # Label windows
+                windows, labels = label_windows_by_vocabulary(
+                    channel, words, word_labels, silence_label=silence_label
+                )
 
-            # Label windows
-            windows, labels = label_windows_by_vocabulary(
-                channel, words, word_labels, silence_label=silence_label
-            )
+                if windows.shape[0] > 0:
+                    all_windows.append(windows)
+                    all_labels.extend(labels)
 
-            if windows.shape[0] > 0:
-                all_windows.append(windows)
-                all_labels.extend(labels)
+            # Check cap after every channel
+            if max_total_windows > 0:
+                total_so_far = sum(w.shape[0] for w in all_windows)
+                if total_so_far >= max_total_windows:
+                    print(f"  Window cap reached ({max_total_windows:,}) after "
+                          f"{os.path.basename(filepath)}, stopping early")
+                    capped = True
+                    break
 
         total_so_far = sum(w.shape[0] for w in all_windows)
         print(f"    {os.path.basename(filepath)}: {total_so_far} windows so far")
-
-        if max_total_windows > 0 and total_so_far >= max_total_windows:
-            print(f"  Window cap reached ({max_total_windows:,}), stopping early")
-            capped = True
-            break
 
     if not all_windows:
         return np.array([]).reshape(0, WINDOW_SAMPLES), np.array([], dtype=int)
