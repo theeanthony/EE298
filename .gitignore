@@ -30,6 +30,21 @@ Thumbs.db
 *.hex
 *.bin
 
+# ML models and checkpoints
+software/ml/models/*.joblib
+software/ml/models/*.npz
+software/ml/models/*.pt
+
+# External datasets
+data/external/
+
+# Synthetic training data
+data/synthetic/*.csv
+data/synthetic/manifest.csv
+
+# ML results (plots, etc.)
+data/ml_results/
+
 # Temporary files
 *.tmp
 *.temp

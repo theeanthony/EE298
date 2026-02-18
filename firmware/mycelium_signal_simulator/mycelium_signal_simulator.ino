@@ -14,17 +14,10 @@
  *
  * OUTPUT: ~0-1.1mV signal (from 5V PWM) or ~0-0.73mV (from 3.3V)
  *
- * SIGNAL MODES (0-9):
- * 0 = Slow sine wave (healthy baseline)
- * 1 = Random walk (biological noise)
- * 2 = Occasional spikes (action potentials)
- * 3 = Composite (most realistic healthy signal)
- * 4 = NOTHING / Dead signal (no mycelium / dead culture)
- * 5 = NOISE ONLY (poor electrode contact / 60Hz interference)
- * 6 = DRIFT (electrode polarization / temperature change)
- * 7 = SATURATION (amplifier clipping / signal too strong)
- * 8 = INTERMITTENT (loose connection / dying mycelium)
- * 9 = STIMULUS RESPONSE (light/touch response simulation)
+ * ARDUINO UNO R4 ADVANTAGES:
+ * - 14-bit ADC (vs 10-bit on Uno R3) = 0.20mV resolution at 3.3V ref
+ * - 3.3V output available for lower voltage divider input
+ * - DAC output on A0 (if needed for analog signal generation)
  */
 
 // ============== PIN DEFINITIONS ==============
@@ -33,40 +26,46 @@ const int ADC_PIN = A0;     // Input pin (from voltage divider)
 const int LED_PIN = 13;     // Built-in LED for activity indicator
 
 // ============== TIMING ==============
-const int SAMPLE_RATE_MS = 100;  // 10 Hz sampling
+const int SAMPLE_RATE_MS = 100;  // 10 Hz sampling (matches real fungal signal bandwidth)
 unsigned long lastSample = 0;
 unsigned long startTime = 0;
 
 // ============== SIGNAL GENERATION ==============
 float phase = 0;
-int signalMode = 3;  // Default to composite (realistic)
+int signalMode = 3;  // Start with Composite mode
 int randomValue = 128;
 unsigned long lastSpike = 0;
-unsigned long lastEvent = 0;
+float driftValue = 0;
+int intermittentCounter = 0;
+unsigned long stimulusTime = 0;
 
-// For intermittent mode
-bool connectionGood = true;
-unsigned long lastConnectionChange = 0;
-
-// For stimulus response mode
-bool stimulusActive = false;
-unsigned long stimulusStart = 0;
+// ============== REALISTIC MYCELIUM PARAMETERS ==============
+// Based on Buffi et al. 2025, Adamatzky et al.
+// Real fungal signals: 0.01-1 Hz, 0.5-2.1 mV amplitude
+float myceliumPhase1 = 0;      // Very slow oscillation (0.01 Hz)
+float myceliumPhase2 = 0;      // Slow oscillation (0.05 Hz)
+float myceliumPhase3 = 0;      // Medium oscillation (0.2 Hz)
+int myceliumBaseline = 128;    // Wandering baseline
+unsigned long lastActionPotential = 0;
+int actionPotentialPhase = 0;  // 0 = none, >0 = in progress
+float nutrientLevel = 1.0;     // Simulated nutrient availability
 
 // ============== STATISTICS ==============
 long sampleCount = 0;
 float adcSum = 0;
-int adcMin = 16383;
+int adcMin = 1023;
 int adcMax = 0;
 
 void setup() {
     Serial.begin(115200);
     while (!Serial) {
-        ; // Wait for serial port
+        ; // Wait for serial port (needed for native USB boards)
     }
 
     pinMode(PWM_PIN, OUTPUT);
     pinMode(LED_PIN, OUTPUT);
 
+    // ============== ADC CONFIGURATION ==============
     #if defined(ARDUINO_UNOR4_MINIMA) || defined(ARDUINO_UNOR4_WIFI)
         analogReadResolution(14);  // Uno R4: Use 14-bit ADC
         Serial.println(F("# Detected: Arduino Uno R4 (14-bit ADC)"));
@@ -75,6 +74,8 @@ void setup() {
     #endif
 
     startTime = millis();
+    randomSeed(analogRead(A1));  // Seed random number generator
+
     printHeader();
 }
 
@@ -84,35 +85,35 @@ void printHeader() {
     Serial.println(F("# EE297B Research Project - SJSU"));
     Serial.println(F("# ================================================"));
     Serial.println(F("#"));
-    Serial.println(F("# === HEALTHY SIGNALS ==="));
-    Serial.println(F("#   0 = Slow sine wave (baseline oscillation)"));
-    Serial.println(F("#   1 = Random walk (biological noise)"));
-    Serial.println(F("#   2 = Occasional spikes (action potentials)"));
-    Serial.println(F("#   3 = Composite (realistic healthy mycelium)"));
+    Serial.println(F("# SIGNAL MODES (0-9, m):"));
+    Serial.println(F("#   0 = Sine          - Clean sine wave"));
+    Serial.println(F("#   1 = Random Walk   - Biological noise"));
+    Serial.println(F("#   2 = Spikes        - Action potentials"));
+    Serial.println(F("#   3 = Composite     - Realistic (DEFAULT)"));
+    Serial.println(F("#   4 = NOTHING       - Flat baseline"));
+    Serial.println(F("#   5 = NOISE         - Pure random noise"));
+    Serial.println(F("#   6 = DRIFT         - Slowly drifting signal"));
+    Serial.println(F("#   7 = SATURATION    - Signal hits limits"));
+    Serial.println(F("#   8 = INTERMITTENT  - On/off pattern"));
+    Serial.println(F("#   9 = STIMULUS      - Response to stimulus"));
+    Serial.println(F("#   m = MYCELIUM      - Realistic fungal signal!"));
     Serial.println(F("#"));
-    Serial.println(F("# === PROBLEM SCENARIOS ==="));
-    Serial.println(F("#   4 = NOTHING (dead/no mycelium)"));
-    Serial.println(F("#   5 = NOISE ONLY (bad electrode/60Hz)"));
-    Serial.println(F("#   6 = DRIFT (electrode polarization)"));
-    Serial.println(F("#   7 = SATURATION (amplifier clipping)"));
-    Serial.println(F("#   8 = INTERMITTENT (loose wire/dying)"));
+    Serial.println(F("# COMMANDS:"));
+    Serial.println(F("#   0-9 = Change signal mode"));
+    Serial.println(F("#   r   = Reset phase/state"));
+    Serial.println(F("#   s   = Print statistics"));
     Serial.println(F("#"));
-    Serial.println(F("# === EXPERIMENT SCENARIOS ==="));
-    Serial.println(F("#   9 = STIMULUS RESPONSE (light/touch)"));
-    Serial.println(F("#"));
-    Serial.println(F("# COMMANDS: 0-9=mode, r=reset, s=stats, ?=help"));
-    Serial.println(F("# OUTPUT: timestamp_ms,pwm,adc_raw,voltage_mV"));
+    Serial.println(F("# OUTPUT FORMAT: timestamp_ms,pwm,adc_raw,voltage_mV"));
     Serial.println(F("# ================================================"));
-    Serial.print(F("# Current mode: "));
-    Serial.print(signalMode);
-    Serial.print(F(" ("));
-    printModeName(signalMode);
-    Serial.println(F(")"));
+    printCurrentMode();
     Serial.println(F("# ================================================"));
 }
 
-void printModeName(int mode) {
-    switch(mode) {
+void printCurrentMode() {
+    Serial.print(F("# Mode: "));
+    Serial.print(signalMode);
+    Serial.print(F(" ("));
+    switch (signalMode) {
         case 0: Serial.print(F("Sine")); break;
         case 1: Serial.print(F("Random Walk")); break;
         case 2: Serial.print(F("Spikes")); break;
@@ -123,25 +124,32 @@ void printModeName(int mode) {
         case 7: Serial.print(F("SATURATION")); break;
         case 8: Serial.print(F("INTERMITTENT")); break;
         case 9: Serial.print(F("STIMULUS")); break;
-        default: Serial.print(F("Unknown")); break;
+        case 10: Serial.print(F("MYCELIUM")); break;
     }
+    Serial.println(F(")"));
 }
 
 void loop() {
+    // Check for serial commands
     handleSerialCommands();
 
     unsigned long now = millis();
 
+    // Sample at fixed rate
     if (now - lastSample >= SAMPLE_RATE_MS) {
         lastSample = now;
         sampleCount++;
 
+        // Generate signal based on current mode
         int pwmValue = generateSignal();
+
+        // Output to voltage divider
         analogWrite(PWM_PIN, pwmValue);
 
-        // LED indicator
+        // Blink LED to show activity (blink faster for higher values)
         digitalWrite(LED_PIN, (pwmValue > 127) ? HIGH : LOW);
 
+        // Read back through ADC (multiple samples for averaging)
         int adcRaw = readADCAverage(4);
 
         // Update statistics
@@ -151,13 +159,13 @@ void loop() {
 
         // Convert to millivolts
         #if defined(ARDUINO_UNOR4_MINIMA) || defined(ARDUINO_UNOR4_WIFI)
-            float adcMillivolts = (adcRaw / 16383.0) * 5000.0;
+            float adcMillivolts = (adcRaw / 16383.0) * 5000.0;  // 14-bit, 5V ref
         #else
-            float adcMillivolts = (adcRaw / 1023.0) * 5000.0;
+            float adcMillivolts = (adcRaw / 1023.0) * 5000.0;   // 10-bit, 5V ref
         #endif
 
-        // Output CSV
-        Serial.print(now - startTime);
+        // Output CSV data
+        Serial.print(now - startTime);  // Relative timestamp
         Serial.print(",");
         Serial.print(pwmValue);
         Serial.print(",");
@@ -180,342 +188,341 @@ int generateSignal() {
     int pwmValue = 0;
 
     switch (signalMode) {
-        case 0: pwmValue = generateSine(); break;
-        case 1: pwmValue = generateRandomWalk(); break;
-        case 2: pwmValue = generateSpikes(); break;
-        case 3: pwmValue = generateComposite(); break;
-        case 4: pwmValue = generateNothing(); break;
-        case 5: pwmValue = generateNoiseOnly(); break;
-        case 6: pwmValue = generateDrift(); break;
-        case 7: pwmValue = generateSaturation(); break;
-        case 8: pwmValue = generateIntermittent(); break;
-        case 9: pwmValue = generateStimulusResponse(); break;
-        default: pwmValue = 128; break;
+        case 0:  // Sine wave
+            pwmValue = generateSine();
+            break;
+
+        case 1:  // Random walk
+            pwmValue = generateRandomWalk();
+            break;
+
+        case 2:  // Spikes
+            pwmValue = generateSpikes();
+            break;
+
+        case 3:  // Composite (most realistic)
+            pwmValue = generateComposite();
+            break;
+
+        case 4:  // NOTHING - flat baseline
+            pwmValue = generateNothing();
+            break;
+
+        case 5:  // NOISE - pure random
+            pwmValue = generateNoise();
+            break;
+
+        case 6:  // DRIFT - slowly changing
+            pwmValue = generateDrift();
+            break;
+
+        case 7:  // SATURATION - hits limits
+            pwmValue = generateSaturation();
+            break;
+
+        case 8:  // INTERMITTENT - on/off
+            pwmValue = generateIntermittent();
+            break;
+
+        case 9:  // STIMULUS - response pattern
+            pwmValue = generateStimulus();
+            break;
+
+        case 10:  // MYCELIUM - realistic fungal bioelectrical signal
+            pwmValue = generateMycelium();
+            break;
+
+        default:
+            pwmValue = 128;
+            break;
     }
 
     return constrain(pwmValue, 0, 255);
 }
 
-// ==================== HEALTHY SIGNALS ====================
-
 int generateSine() {
     // Slow sine wave: ~0.05 Hz (20 second period)
     phase += 0.0314;
     if (phase > TWO_PI) phase -= TWO_PI;
+
+    // Center at 128, amplitude of 100 (gives PWM 28-228)
     return 128 + (int)(100.0 * sin(phase));
 }
 
 int generateRandomWalk() {
-    // Random walk with mean reversion
+    // Random walk with mean reversion (mimics biological noise)
     randomValue += random(-5, 6);
+
+    // Mean reversion: pull slightly toward center (128)
     if (randomValue > 128) randomValue -= 1;
     if (randomValue < 128) randomValue += 1;
+
+    // Constrain to valid range
     randomValue = constrain(randomValue, 20, 235);
+
     return randomValue;
 }
 
 int generateSpikes() {
     // Low baseline with occasional spikes
-    int baseline = 30;
+    int baseline = 30;  // Low baseline (~12% PWM)
     int pwmValue = baseline;
 
+    // Random spike every 3-10 seconds
     if (millis() - lastSpike > (unsigned long)random(3000, 10000)) {
-        pwmValue = random(180, 250);
+        // Spike!
+        pwmValue = random(180, 250);  // High spike (70-98% PWM)
         lastSpike = millis();
     }
+
     return pwmValue;
 }
 
 int generateComposite() {
-    // Most realistic healthy signal
+    // Most realistic: combines all three modes
+    // Slow underlying oscillation (very slow: 60 sec period)
     float slowPhase = (millis() - startTime) / 60000.0 * TWO_PI;
     int base = 128 + (int)(40.0 * sin(slowPhase));
-    int noise = random(-20, 21);
-    int spike = 0;
 
+    // Add random noise (±20)
+    int noise = random(-20, 21);
+
+    // Occasional spike
+    int spike = 0;
     if (millis() - lastSpike > (unsigned long)random(5000, 15000)) {
-        spike = random(80, 120);
+        spike = random(80, 120);  // Spike adds 80-120 to current value
         lastSpike = millis();
+        Serial.println(F("# [SPIKE EVENT]"));
     }
+
     return constrain(base + noise + spike, 0, 255);
 }
 
-// ==================== PROBLEM SCENARIOS ====================
-
 int generateNothing() {
-    /*
-     * SCENARIO: No signal / Dead mycelium / No mycelium present
-     *
-     * What you'd see in real life:
-     * - Flat line at some DC offset
-     * - Very small random noise from ADC
-     * - No biological activity
-     *
-     * Causes:
-     * - Mycelium hasn't colonized electrodes yet
-     * - Mycelium is dead
-     * - Electrodes not in contact with mycelium
-     * - Amplifier not connected
-     */
-
-    // Flat DC with tiny ADC noise
-    return 128 + random(-2, 3);
+    // Flat baseline - mimics dead/no signal
+    // Just slight noise to show it's "alive"
+    return 50 + random(-3, 4);  // Very flat around 50
 }
 
-int generateNoiseOnly() {
-    /*
-     * SCENARIO: High noise, no clear signal
-     *
-     * What you'd see in real life:
-     * - High amplitude random fluctuations
-     * - Possible 60Hz component (mains interference)
-     * - No discernible biological pattern
-     *
-     * Causes:
-     * - Poor electrode contact
-     * - 60 Hz mains interference (no Faraday cage)
-     * - Ground loop
-     * - Damaged shielding
-     * - EMI from nearby electronics
-     */
-
-    // Simulate 60Hz interference (6 samples per cycle at 10Hz = aliased)
-    float noise60Hz = 50.0 * sin(2 * PI * 6.0 * (millis() / 1000.0));
-
-    // Add random broadband noise
-    int broadbandNoise = random(-60, 61);
-
-    // Small DC offset
-    int dc = 128;
-
-    return dc + (int)noise60Hz + broadbandNoise;
+int generateNoise() {
+    // Pure random noise - like electrical interference
+    return random(0, 256);  // Full random range
 }
 
 int generateDrift() {
-    /*
-     * SCENARIO: Slow baseline drift
-     *
-     * What you'd see in real life:
-     * - Signal slowly moves up or down over minutes
-     * - May eventually saturate at rail
-     * - Small variations on top of drift
-     *
-     * Causes:
-     * - Electrode polarization
-     * - Temperature changes
-     * - Electrode chemistry changing
-     * - Moisture changes on electrode
-     * - Long-term biological changes
-     */
-
-    // Very slow drift (over 2 minutes, drift from 50 to 200)
-    float driftTime = (millis() - startTime) / 120000.0;  // 0 to 1 over 2 min
-    driftTime = fmod(driftTime, 1.0);  // Repeat
-
-    // Sawtooth drift pattern
-    int drift;
-    if (driftTime < 0.5) {
-        drift = 50 + (int)(150.0 * (driftTime * 2));  // Rising
-    } else {
-        drift = 200 - (int)(150.0 * ((driftTime - 0.5) * 2));  // Falling
+    // Slowly drifting signal - mimics electrode drift or temperature changes
+    driftValue += 0.3;  // Slow upward drift
+    
+    // Reset when it gets too high
+    if (driftValue > 200) {
+        driftValue = 30;
     }
-
-    // Add small biological signal on top
-    int bio = (int)(20.0 * sin(phase));
-    phase += 0.0314;
-    if (phase > TWO_PI) phase -= TWO_PI;
-
-    return drift + bio + random(-5, 6);
+    
+    // Add small noise
+    int noise = random(-10, 11);
+    
+    return constrain((int)driftValue + noise, 0, 255);
 }
 
 int generateSaturation() {
-    /*
-     * SCENARIO: Amplifier saturation / clipping
-     *
-     * What you'd see in real life:
-     * - Signal hits max or min and stays flat
-     * - "Clipped" waveform tops/bottoms
-     * - Lost information during saturation
-     *
-     * Causes:
-     * - Gain too high on amplifier
-     * - Signal amplitude larger than expected
-     * - DC offset pushing signal to rail
-     * - Power supply issues
-     */
-
-    // Generate a signal that's too large
-    float largeSignal = 128 + 200.0 * sin(phase);
-    phase += 0.05;  // Faster oscillation
-    if (phase > TWO_PI) phase -= TWO_PI;
-
-    // Clip at boundaries (simulates amplifier saturation)
-    int pwm = (int)largeSignal;
-    if (pwm > 250) pwm = 250;  // Clipped at top
-    if (pwm < 5) pwm = 5;      // Clipped at bottom
-
-    return pwm;
+    // Signal that frequently hits the limits (clipping)
+    // Oscillates but clips at top and bottom
+    float fastPhase = (millis() - startTime) / 3000.0 * TWO_PI;
+    int base = 128 + (int)(150.0 * sin(fastPhase));  // Large amplitude - will clip!
+    
+    return constrain(base, 0, 255);  // This will saturate/clip
 }
 
 int generateIntermittent() {
-    /*
-     * SCENARIO: Intermittent signal / connection problems
-     *
-     * What you'd see in real life:
-     * - Signal comes and goes
-     * - Sudden jumps or dropouts
-     * - May look normal then suddenly flat or noisy
-     *
-     * Causes:
-     * - Loose wire connection
-     * - Dying mycelium (sporadic activity)
-     * - Intermittent electrode contact
-     * - Cold solder joint
-     * - Vibration affecting connections
-     */
-
-    // Randomly switch between good and bad connection
-    if (millis() - lastConnectionChange > (unsigned long)random(2000, 8000)) {
-        connectionGood = !connectionGood;
-        lastConnectionChange = millis();
-
-        if (connectionGood) {
-            Serial.println(F("# [INTERMITTENT] Connection restored"));
-        } else {
-            Serial.println(F("# [INTERMITTENT] Connection lost!"));
-        }
-    }
-
-    if (connectionGood) {
-        // Normal composite signal
-        return generateComposite();
+    // Signal that cuts in and out - mimics loose connection
+    intermittentCounter++;
+    
+    // Pattern: 30 samples ON, 20 samples OFF (3 sec on, 2 sec off)
+    if ((intermittentCounter % 50) < 30) {
+        // ON - generate normal composite signal
+        int base = 128 + random(-30, 31);
+        Serial.println(F("# [INTERMITTENT: ON]"));
+        return base;
     } else {
-        // Disconnected: either flat or very noisy
-        if (random(0, 2) == 0) {
-            return random(0, 10);  // Near ground
-        } else {
-            return random(245, 256);  // Near rail
+        // OFF - near zero
+        if (intermittentCounter % 50 == 30) {
+            Serial.println(F("# [INTERMITTENT: OFF]"));
         }
+        return random(0, 10);
     }
 }
 
-// ==================== EXPERIMENT SCENARIOS ====================
+int generateStimulus() {
+    // Simulates response to external stimulus
+    // Quiet baseline, then big response when "stimulated"
 
-int generateStimulusResponse() {
-    /*
-     * SCENARIO: Response to environmental stimulus
-     *
-     * What you'd see in real life:
-     * - Baseline activity
-     * - Stimulus applied (light, touch, chemical)
-     * - Increased activity / spike rate
-     * - Gradual return to baseline
-     *
-     * Based on Adamatzky et al. research showing
-     * mycelium responds to light and mechanical stimuli
-     */
+    unsigned long timeSinceStimulus = millis() - stimulusTime;
 
-    // Check for stimulus trigger (every 15-30 seconds)
-    if (!stimulusActive && (millis() - lastEvent > (unsigned long)random(15000, 30000))) {
-        stimulusActive = true;
-        stimulusStart = millis();
-        lastEvent = millis();
-        Serial.println(F("# [STIMULUS] Applied! (light/touch)"));
+    // Auto-trigger stimulus every 15 seconds
+    if (timeSinceStimulus > 15000) {
+        stimulusTime = millis();
+        timeSinceStimulus = 0;
+        Serial.println(F("# [STIMULUS APPLIED!]"));
     }
 
-    // Stimulus response lasts 5-10 seconds
-    if (stimulusActive && (millis() - stimulusStart > (unsigned long)random(5000, 10000))) {
-        stimulusActive = false;
-        Serial.println(F("# [STIMULUS] Response complete, returning to baseline"));
-    }
-
-    int pwmValue;
-
-    if (stimulusActive) {
-        // DURING STIMULUS: increased activity
-        // Higher baseline, more frequent spikes, larger amplitude
-
-        float responsePhase = (millis() - stimulusStart) / 5000.0;  // 0 to ~1
-        int excitation = (int)(80.0 * (1.0 - responsePhase));  // Decaying response
-
-        // Elevated baseline with rapid oscillations
-        pwmValue = 150 + excitation + (int)(30.0 * sin(phase * 3));
-
-        // More frequent spikes during stimulus
-        if (random(0, 10) < 3) {  // 30% chance per sample
-            pwmValue += random(50, 100);
-        }
-
-        // Add noise
-        pwmValue += random(-15, 16);
-
+    // Response curve: rapid rise, slow decay
+    if (timeSinceStimulus < 5000) {
+        // First 5 seconds: active response
+        float response = exp(-timeSinceStimulus / 2000.0);  // Exponential decay
+        int magnitude = (int)(150.0 * response);
+        return 80 + magnitude + random(-10, 11);
     } else {
-        // BASELINE: normal quiet activity
-        float slowPhase = (millis() - startTime) / 60000.0 * TWO_PI;
-        pwmValue = 100 + (int)(20.0 * sin(slowPhase));
-        pwmValue += random(-10, 11);
-
-        // Occasional baseline spike
-        if (millis() - lastSpike > (unsigned long)random(8000, 20000)) {
-            pwmValue += random(40, 80);
-            lastSpike = millis();
-        }
+        // After 5 sec: back to baseline
+        return 80 + random(-10, 11);
     }
-
-    phase += 0.1;
-    if (phase > TWO_PI) phase -= TWO_PI;
-
-    return pwmValue;
 }
 
-// ==================== SERIAL COMMANDS ====================
+int generateMycelium() {
+    /*
+     * REALISTIC MYCELIUM BIOELECTRICAL SIGNAL SIMULATION
+     * Based on research from:
+     * - Buffi et al. 2025: STFT analysis of fungal signals
+     * - Adamatzky et al.: Fungal action potentials
+     * - Olsson & Hansson: Mycelial electrical oscillations
+     *
+     * Real characteristics:
+     * - Frequency range: 0.01-1 Hz (very slow!)
+     * - Amplitude: 0.5-2.1 mV
+     * - Action potentials: 1-5 min duration, irregular intervals
+     * - Multiple overlapping oscillations
+     * - Baseline drift over hours
+     * - Response to nutrients, light, touch
+     */
+
+    int pwmValue = 0;
+
+    // ===== 1. MULTIPLE SLOW OSCILLATIONS =====
+    // These represent different biological rhythms in the mycelium
+
+    // Very slow circadian-like rhythm (0.01 Hz ~ 100 sec period)
+    myceliumPhase1 += 0.000628;  // 2*PI / (100 sec * 10 Hz)
+    if (myceliumPhase1 > TWO_PI) myceliumPhase1 -= TWO_PI;
+    float wave1 = 30.0 * sin(myceliumPhase1);
+
+    // Slow metabolic rhythm (0.05 Hz ~ 20 sec period)
+    myceliumPhase2 += 0.00314;   // 2*PI / (20 sec * 10 Hz)
+    if (myceliumPhase2 > TWO_PI) myceliumPhase2 -= TWO_PI;
+    float wave2 = 20.0 * sin(myceliumPhase2);
+
+    // Faster signaling rhythm (0.2 Hz ~ 5 sec period)
+    myceliumPhase3 += 0.01257;   // 2*PI / (5 sec * 10 Hz)
+    if (myceliumPhase3 > TWO_PI) myceliumPhase3 -= TWO_PI;
+    float wave3 = 15.0 * sin(myceliumPhase3);
+
+    // ===== 2. WANDERING BASELINE =====
+    // Mycelium baseline slowly drifts (electrode polarization, growth, etc.)
+    if (random(100) < 3) {  // 3% chance each sample
+        myceliumBaseline += random(-2, 3);  // Small drift
+        myceliumBaseline = constrain(myceliumBaseline, 100, 156);
+    }
+
+    // ===== 3. ACTION POTENTIALS (SPIKES) =====
+    // Real mycelium shows irregular "spiking trains"
+    // Duration: 1-5 minutes, Interval: 10-30 minutes (scaled down for demo)
+
+    int actionPotential = 0;
+
+    if (actionPotentialPhase > 0) {
+        // Currently in an action potential event
+        actionPotentialPhase--;
+
+        // Action potential shape: fast rise, slow decay
+        if (actionPotentialPhase > 40) {
+            // Rising phase (first ~4 seconds)
+            actionPotential = map(actionPotentialPhase, 50, 40, 0, 80);
+        } else if (actionPotentialPhase > 10) {
+            // Plateau phase (middle ~3 seconds)
+            actionPotential = 80 + random(-5, 6);
+        } else {
+            // Decay phase (last ~1 second)
+            actionPotential = map(actionPotentialPhase, 10, 0, 80, 0);
+        }
+
+        if (actionPotentialPhase == 0) {
+            Serial.println(F("# [MYCELIUM] Action potential ended"));
+        }
+    } else {
+        // Check for new action potential (random, ~every 20-60 seconds)
+        if (millis() - lastActionPotential > (unsigned long)random(20000, 60000)) {
+            actionPotentialPhase = 50;  // ~5 second duration
+            lastActionPotential = millis();
+            Serial.println(F("# [MYCELIUM] Action potential started!"));
+        }
+    }
+
+    // ===== 4. BIOLOGICAL NOISE =====
+    // Low-amplitude, slightly correlated noise
+    static int bioNoise = 0;
+    bioNoise += random(-3, 4);  // Random walk
+    bioNoise = bioNoise * 0.9;   // Decay toward zero
+    bioNoise = constrain(bioNoise, -15, 15);
+
+    // ===== 5. NUTRIENT RESPONSE =====
+    // Simulate periodic "feeding" events that increase activity
+    static unsigned long lastNutrientTime = 0;
+    int nutrientBoost = 0;
+
+    if (millis() - lastNutrientTime > 45000) {  // Every 45 seconds
+        lastNutrientTime = millis();
+        nutrientLevel = 1.5;  // Boost activity
+        Serial.println(F("# [MYCELIUM] Nutrient pulse detected"));
+    }
+
+    // Nutrient effect decays over time
+    if (nutrientLevel > 1.0) {
+        nutrientLevel -= 0.005;  // Slow decay
+        nutrientBoost = (int)((nutrientLevel - 1.0) * 40.0);
+    }
+
+    // ===== COMBINE ALL COMPONENTS =====
+    pwmValue = myceliumBaseline
+             + (int)(wave1 * nutrientLevel)
+             + (int)(wave2 * nutrientLevel)
+             + (int)wave3
+             + actionPotential
+             + bioNoise
+             + nutrientBoost;
+
+    return constrain(pwmValue, 0, 255);
+}
 
 void handleSerialCommands() {
     while (Serial.available()) {
         char cmd = Serial.read();
 
-        switch (cmd) {
-            case '0': case '1': case '2': case '3':
-            case '4': case '5': case '6': case '7':
-            case '8': case '9':
-                signalMode = cmd - '0';
-                Serial.print(F("# Mode: "));
-                Serial.print(signalMode);
-                Serial.print(F(" ("));
-                printModeName(signalMode);
-                Serial.println(F(")"));
-                resetState();
-                break;
-
-            case 'r': case 'R':
-                resetState();
-                Serial.println(F("# State Reset"));
-                break;
-
-            case 's': case 'S':
-                printStatistics();
-                break;
-
-            case '?': case 'h': case 'H':
-                printHeader();
-                break;
-
-            case 't': case 'T':
-                // Manual trigger for stimulus mode
-                if (signalMode == 9) {
-                    stimulusActive = true;
-                    stimulusStart = millis();
-                    Serial.println(F("# [STIMULUS] Manual trigger!"));
-                }
-                break;
-
-            case '\n': case '\r':
-                break;
-
-            default:
-                Serial.print(F("# Unknown command: "));
-                Serial.println(cmd);
-                break;
+        // Check if it's a digit 0-9
+        if (cmd >= '0' && cmd <= '9') {
+            signalMode = cmd - '0';  // Convert char to int
+            resetState();  // Reset state when changing modes
+            printCurrentMode();
+        }
+        else if (cmd == 'm' || cmd == 'M') {
+            signalMode = 10;  // MYCELIUM mode
+            resetState();
+            printCurrentMode();
+            Serial.println(F("# [MYCELIUM] Realistic fungal signal simulation"));
+            Serial.println(F("# Features: slow oscillations, action potentials, nutrient response"));
+        }
+        else if (cmd == 'r' || cmd == 'R') {
+            resetState();
+            Serial.println(F("# State Reset"));
+        }
+        else if (cmd == 's' || cmd == 'S') {
+            printStatistics();
+        }
+        else if (cmd == '?' || cmd == 'h' || cmd == 'H') {
+            printHeader();
+        }
+        else if (cmd == '\n' || cmd == '\r') {
+            // Ignore newlines
+        }
+        else {
+            // Unknown command - just ignore
         }
     }
 }
@@ -524,59 +531,52 @@ void resetState() {
     phase = 0;
     randomValue = 128;
     lastSpike = millis();
-    lastEvent = millis();
-    sampleCount = 0;
-    adcSum = 0;
-    adcMin = 16383;
-    adcMax = 0;
-    startTime = millis();
-    connectionGood = true;
-    lastConnectionChange = millis();
-    stimulusActive = false;
+    driftValue = 30;
+    intermittentCounter = 0;
+    stimulusTime = millis();
+    startTime = millis();  // Reset timer too
+
+    // Reset mycelium state
+    myceliumPhase1 = 0;
+    myceliumPhase2 = 0;
+    myceliumPhase3 = 0;
+    myceliumBaseline = 128;
+    lastActionPotential = millis();
+    actionPotentialPhase = 0;
+    nutrientLevel = 1.0;
 }
 
 void printStatistics() {
     Serial.println(F("# --- STATISTICS ---"));
-    Serial.print(F("# Mode: "));
-    printModeName(signalMode);
-    Serial.println();
     Serial.print(F("# Samples: "));
     Serial.println(sampleCount);
     Serial.print(F("# Runtime: "));
     Serial.print((millis() - startTime) / 1000.0, 1);
     Serial.println(F(" sec"));
-
+    Serial.print(F("# ADC Min: "));
+    Serial.print(adcMin);
+    Serial.print(F(" ("));
+    Serial.print((adcMin / 1023.0) * 5000.0, 2);
+    Serial.println(F(" mV)"));
+    Serial.print(F("# ADC Max: "));
+    Serial.print(adcMax);
+    Serial.print(F(" ("));
     #if defined(ARDUINO_UNOR4_MINIMA) || defined(ARDUINO_UNOR4_WIFI)
-        Serial.print(F("# ADC Min: "));
-        Serial.print(adcMin);
-        Serial.print(F(" ("));
-        Serial.print((adcMin / 16383.0) * 5000.0, 3);
-        Serial.println(F(" mV)"));
-        Serial.print(F("# ADC Max: "));
-        Serial.print(adcMax);
-        Serial.print(F(" ("));
         Serial.print((adcMax / 16383.0) * 5000.0, 3);
-        Serial.println(F(" mV)"));
-        if (sampleCount > 0) {
-            float avg = adcSum / sampleCount;
-            Serial.print(F("# ADC Avg: "));
-            Serial.print(avg, 1);
-            Serial.print(F(" ("));
-            Serial.print((avg / 16383.0) * 5000.0, 3);
-            Serial.println(F(" mV)"));
-        }
     #else
-        Serial.print(F("# ADC Min: "));
-        Serial.print(adcMin);
-        Serial.print(F(" ("));
-        Serial.print((adcMin / 1023.0) * 5000.0, 2);
-        Serial.println(F(" mV)"));
-        Serial.print(F("# ADC Max: "));
-        Serial.print(adcMax);
-        Serial.print(F(" ("));
         Serial.print((adcMax / 1023.0) * 5000.0, 2);
-        Serial.println(F(" mV)"));
     #endif
-
+    Serial.println(F(" mV)"));
+    Serial.print(F("# ADC Avg: "));
+    float avg = adcSum / sampleCount;
+    Serial.print(avg, 1);
+    Serial.print(F(" ("));
+    #if defined(ARDUINO_UNOR4_MINIMA) || defined(ARDUINO_UNOR4_WIFI)
+        Serial.print((avg / 16383.0) * 5000.0, 3);
+    #else
+        Serial.print((avg / 1023.0) * 5000.0, 2);
+    #endif
+    Serial.println(F(" mV)"));
+    printCurrentMode();
     Serial.println(F("# -----------------"));
 }
