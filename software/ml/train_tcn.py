@@ -648,8 +648,10 @@ def run_phase2_vocabulary(device, batch_size=32, epochs=10, lr=1e-4, num_workers
     K = len(np.unique(y))
     print(f"  {X.shape[0]} windows, {K} classes (word types + silence)")
 
-    # Augment to balance classes
-    X, y = augment_dataset(X, y, n_augmented_per_sample=2, balance_classes=True)
+    # Light augmentation — no class balancing for vocabulary mode.
+    # Vocabulary classes are inherently imbalanced (Zipf's law); upsampling
+    # minority word types to match silence would create 900k+ windows and OOM.
+    X, y = augment_dataset(X, y, n_augmented_per_sample=1, balance_classes=False)
     print(f"  After augmentation: {X.shape[0]} windows")
     log_memory("After vocab data load + augment")
 
