@@ -645,8 +645,15 @@ def run_phase2_vocabulary(device, batch_size=32, epochs=10, lr=1e-4, num_workers
         print("  No vocabulary data — run spike_vocabulary.py first")
         return None
 
-    K = len(np.unique(y))
+    # Remap labels to contiguous 0..K-1.
+    # k-means labels are sparse (e.g. {0,1,5,11,38,50}) when the window cap
+    # stops early — CrossEntropyLoss requires contiguous 0-based labels.
+    unique_labels = np.sort(np.unique(y))
+    label_map = {old: new for new, old in enumerate(unique_labels)}
+    y = np.array([label_map[lbl] for lbl in y], dtype=int)
+    K = len(unique_labels)
     print(f"  {X.shape[0]} windows, {K} classes (word types + silence)")
+    print(f"  Label remap: {dict(list(label_map.items())[:8])}{'...' if len(label_map) > 8 else ''}")
 
     # Light augmentation — no class balancing for vocabulary mode.
     # Vocabulary classes are inherently imbalanced (Zipf's law); upsampling
