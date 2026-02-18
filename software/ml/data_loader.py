@@ -378,7 +378,7 @@ def load_buffi_stimulus_labeled(buffi_dir: str,
     return X, y
 
 
-def load_vocabulary_labeled(cache_path: str) -> Tuple[np.ndarray, np.ndarray]:
+def load_vocabulary_labeled(cache_path: str) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Load pre-computed vocabulary-labeled windows from spike_vocabulary.py output.
 
@@ -388,6 +388,8 @@ def load_vocabulary_labeled(cache_path: str) -> Tuple[np.ndarray, np.ndarray]:
     Returns:
         X: 2D array (n_windows, window_samples) with cluster-labeled windows
         y: 1D array of word-type cluster IDs (0..K where K=silence)
+        unique_labels: 1D array of original k-means IDs present in y,
+                       sorted ascending. Index i → original ID for remapped class i.
     """
     if not os.path.exists(cache_path):
         raise FileNotFoundError(
@@ -398,9 +400,10 @@ def load_vocabulary_labeled(cache_path: str) -> Tuple[np.ndarray, np.ndarray]:
     data = np.load(cache_path)
     X = data['X']
     y = data['y']
+    unique_labels = data['unique_labels'] if 'unique_labels' in data else np.sort(np.unique(y))
     print(f"  Loaded vocabulary-labeled data: {X.shape[0]} windows, "
           f"{len(np.unique(y))} classes")
-    return X, y
+    return X, y, unique_labels
 
 
 def load_buffi_data(buffi_dir: str) -> Tuple[np.ndarray, np.ndarray]:

@@ -40,6 +40,7 @@ PLOTS_DIR = os.path.join(PROJECT_ROOT, 'data', 'ml_results')
 
 DEFAULT_TCN_PATH = os.path.join(MODELS_DIR, 'tcn_phase2_vocabulary.pt')
 VOCAB_STATS_PATH = os.path.join(PLOTS_DIR, 'vocabulary_stats.json')
+VOCAB_LABELS_PATH = os.path.join(MODELS_DIR, 'vocabulary_labels.npz')
 DICTIONARY_PATH = os.path.join(MODELS_DIR, 'fungal_dictionary.json')
 
 
@@ -128,6 +129,19 @@ def build_dictionary(tcn_model_path=DEFAULT_TCN_PATH, buffi_dir=BUFFI_DIR):
         print("  No Buffi data loaded")
         return None
 
+    # Load unique_labels to map remapped TCN outputs back to original k-means IDs.
+    # Phase 2 trained with contiguous labels 0..K-1 (remapped), but
+    # vocabulary_stats.json uses the original k-means cluster IDs as keys.
+    if os.path.exists(VOCAB_LABELS_PATH):
+        vocab_data = np.load(VOCAB_LABELS_PATH)
+        unique_labels = vocab_data['unique_labels'] if 'unique_labels' in vocab_data \
+            else np.sort(np.unique(vocab_data['y']))
+        print(f"  Loaded unique_labels from vocabulary_labels.npz: {unique_labels}")
+    else:
+        unique_labels = None
+        print("  WARNING: vocabulary_labels.npz not found — "
+              "dictionary keys will use remapped IDs and may not match vocabulary_stats.json")
+
     # Run TCN on all Buffi windows
     print(f"\n  Running TCN inference on {X_buffi.shape[0]} windows...")
     word_preds = predict_word_types(model, X_buffi, device)
@@ -139,8 +153,14 @@ def build_dictionary(tcn_model_path=DEFAULT_TCN_PATH, buffi_dir=BUFFI_DIR):
     print(f"\n  Building dictionary ({len(word_types)} word types detected)...")
 
     dictionary = {}
-    for wtype in word_types:
-        wtype_mask = word_preds == wtype
+    for wtype_remapped in word_types:
+        # Convert remapped label back to original k-means cluster ID
+        if unique_labels is not None and wtype_remapped < len(unique_labels):
+            original_id = int(unique_labels[wtype_remapped])
+        else:
+            original_id = int(wtype_remapped)
+
+        wtype_mask = word_preds == wtype_remapped
         stim_labels_for_wtype = y_stim[wtype_mask]
 
         # Count per stimulus
@@ -163,14 +183,15 @@ def build_dictionary(tcn_model_path=DEFAULT_TCN_PATH, buffi_dir=BUFFI_DIR):
         # Normalize distribution to fractions
         stim_fractions = {k: v / total_count for k, v in stim_distribution.items()}
 
-        dictionary[str(int(wtype))] = {
+        dictionary[str(original_id)] = {
             'total_occurrences': total_count,
             'primary_stimulus': primary_stim,
             'confidence': round(confidence, 3),
             'stimulus_distribution': {k: round(v, 3) for k, v in stim_fractions.items()},
         }
 
-    # Load vocabulary stats to enrich with feature info
+    # Load vocabulary stats to enrich with feature info.
+    # dictionary keys are now original k-means IDs, matching vocabulary_stats.json.
     if os.path.exists(VOCAB_STATS_PATH):
         with open(VOCAB_STATS_PATH, 'r') as f:
             vocab_stats = json.load(f)

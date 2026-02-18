@@ -425,7 +425,7 @@ def label_windows_by_vocabulary(signal, words, word_labels,
 
 def build_labeled_dataset(adamatzky_dir=ADAMATZKY_DIR, kmeans=None,
                           scaler=None, max_rows=36000, theta_multiplier=1.0,
-                          max_total_windows=50000):
+                          max_total_windows=200000):
     """
     Build vocabulary-labeled windows for TCN Phase 2 training.
 
@@ -436,11 +436,11 @@ def build_labeled_dataset(adamatzky_dir=ADAMATZKY_DIR, kmeans=None,
         adamatzky_dir: Path to Adamatzky .txt files
         kmeans: Fitted KMeans model
         scaler: Fitted StandardScaler
-        max_rows: Max rows per file
+        max_rows: Max rows per file (use --label-max-rows to keep all species)
         theta_multiplier: Temporal threshold multiplier
-        max_total_windows: Cap on total windows collected (0 = unlimited).
-                           Default 50,000 — after 2x augmentation stays ~150k,
-                           keeping peak memory under ~400 MB on Colab.
+        max_total_windows: Safety cap on total windows (0 = unlimited).
+                           Default 200,000 — well above the ~40k expected with
+                           --label-max-rows 36000 across 4 species.
 
     Returns:
         X: 2D array (n_windows, 600)
@@ -660,7 +660,10 @@ def main():
     parser.add_argument('--theta', type=float, default=1.0,
                         help='ISI threshold multiplier (default: 1.0, Adamatzky also used 2.0)')
     parser.add_argument('--max-rows', type=int, default=36000,
-                        help='Max rows per Adamatzky file (default: 36000)')
+                        help='Max rows per Adamatzky file for Step 1 vocabulary discovery (default: 36000)')
+    parser.add_argument('--label-max-rows', type=int, default=36000,
+                        help='Max rows per file for Step 3 labeling (default: 36000). '
+                             'Keeps all 4 species in the labeled dataset.')
     parser.add_argument('--adamatzky-dir', type=str, default=ADAMATZKY_DIR)
     parser.add_argument('--analyze', action='store_true',
                         help='Load saved model and show vocabulary analysis')
@@ -716,7 +719,8 @@ def main():
     print(f"\n  Parameters:")
     print(f"    k = {args.n_clusters}")
     print(f"    theta multiplier = {args.theta}")
-    print(f"    max rows/file = {args.max_rows}")
+    print(f"    max rows/file (Step 1) = {args.max_rows}")
+    print(f"    label-max-rows (Step 3) = {args.label_max_rows}")
     print(f"    data dir = {args.adamatzky_dir}")
 
     # Step 1: Discover vocabulary
@@ -747,12 +751,14 @@ def main():
     print("\n  Step 3: Building labeled dataset for TCN Phase 2...")
     X, y = build_labeled_dataset(
         args.adamatzky_dir, kmeans, scaler,
-        max_rows=args.max_rows, theta_multiplier=args.theta,
+        max_rows=args.label_max_rows, theta_multiplier=args.theta,
     )
 
     if X.shape[0] > 0:
         os.makedirs(MODELS_DIR, exist_ok=True)
-        np.savez_compressed(VOCAB_LABELS_PATH, X=X, y=y)
+        unique_present = np.sort(np.unique(y))
+        np.savez_compressed(VOCAB_LABELS_PATH, X=X, y=y,
+                            unique_labels=unique_present)
         size_mb = os.path.getsize(VOCAB_LABELS_PATH) / (1024 * 1024)
         print(f"\n  Labeled dataset saved: {VOCAB_LABELS_PATH} ({size_mb:.1f} MB)")
     else:

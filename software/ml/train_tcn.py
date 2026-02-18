@@ -110,9 +110,14 @@ def get_device():
 # ============================================================
 
 def train_phase(model, train_loader, val_loader, epochs, lr, device,
-                patience=3, phase_name=""):
+                patience=3, phase_name="", class_weights=None):
     """
     Shared training loop for all 3 phases.
+
+    Args:
+        class_weights: Optional FloatTensor of per-class weights for
+                       CrossEntropyLoss. Pass to handle imbalanced classes
+                       without memory-intensive oversampling.
 
     Returns:
         best_val_loss: Best validation loss achieved
@@ -120,7 +125,7 @@ def train_phase(model, train_loader, val_loader, epochs, lr, device,
     """
     optimizer = Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=lr)
     scheduler = ReduceLROnPlateau(optimizer, mode='min', patience=2, factor=0.5)
-    criterion = nn.CrossEntropyLoss()
+    criterion = nn.CrossEntropyLoss(weight=class_weights)
 
     best_val_loss = float('inf')
     patience_counter = 0
@@ -639,7 +644,7 @@ def run_phase2_vocabulary(device, batch_size=32, epochs=10, lr=1e-4, num_workers
 
     # Load vocabulary-labeled data (from spike_vocabulary.py)
     print("\n  Loading vocabulary-labeled windows...")
-    X, y = load_vocabulary_labeled(VOCAB_LABELS_PATH)
+    X, y, unique_labels = load_vocabulary_labeled(VOCAB_LABELS_PATH)
 
     if X.shape[0] == 0:
         print("  No vocabulary data — run spike_vocabulary.py first")
@@ -648,12 +653,19 @@ def run_phase2_vocabulary(device, batch_size=32, epochs=10, lr=1e-4, num_workers
     # Remap labels to contiguous 0..K-1.
     # k-means labels are sparse (e.g. {0,1,5,11,38,50}) when the window cap
     # stops early — CrossEntropyLoss requires contiguous 0-based labels.
-    unique_labels = np.sort(np.unique(y))
     label_map = {old: new for new, old in enumerate(unique_labels)}
     y = np.array([label_map[lbl] for lbl in y], dtype=int)
     K = len(unique_labels)
     print(f"  {X.shape[0]} windows, {K} classes (word types + silence)")
     print(f"  Label remap: {dict(list(label_map.items())[:8])}{'...' if len(label_map) > 8 else ''}")
+
+    # Compute inverse-frequency class weights to handle Zipfian imbalance
+    # without oversampling (which would OOM on large vocabularies).
+    counts = np.bincount(y, minlength=K).astype(float)
+    raw_weights = 1.0 / (counts + 1e-6)
+    class_weights = torch.FloatTensor(raw_weights / raw_weights.sum() * K).to(device)
+    print(f"  Class weights (min={class_weights.min():.3f}, "
+          f"max={class_weights.max():.3f})")
 
     # Light augmentation — no class balancing for vocabulary mode.
     # Vocabulary classes are inherently imbalanced (Zipf's law); upsampling
@@ -687,10 +699,10 @@ def run_phase2_vocabulary(device, batch_size=32, epochs=10, lr=1e-4, num_workers
     print(f"  Model: {total:,} total, {trainable:,} trainable (blocks 3-4 + head)")
     model = model.to(device)
 
-    # Train
+    # Train with weighted loss to counter class imbalance
     best_loss, history = train_phase(
         model, train_loader, val_loader, epochs, lr, device,
-        patience=3, phase_name="Phase2-Vocab"
+        patience=3, phase_name="Phase2-Vocab", class_weights=class_weights
     )
     print(f"  Best val loss: {best_loss:.4f}")
 
