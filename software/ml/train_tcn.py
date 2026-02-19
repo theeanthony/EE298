@@ -1051,7 +1051,8 @@ def run_phase3_stimulus(device, batch_size=32, epochs=10, lr=1e-4, num_workers=0
     best_loss, history = train_phase(
         model, train_loader, val_loader, epochs, lr, device,
         patience=3, phase_name="Phase3-Stimulus",
-        use_focal=use_focal, use_mixup=use_mixup,
+        use_focal=False,      # Phase 3 uses balanced classes; FocalLoss suppresses easy classes
+        use_mixup=use_mixup,
         warmup_epochs=warmup_epochs,
     )
     print(f"  Best val loss: {best_loss:.4f}")
