@@ -334,13 +334,12 @@ python3 software/acquisition/long_duration_logger.py --port /dev/cu.usbmodem1401
 
 ### TEST 5 — 48-hour headless run (start now, inoculate after it passes)
 
-**Start the long-duration test using start_logger.sh:**
+**STATUS: RUNNING — started 2026-02-20 ~12:00 PST. Check back 2026-02-22 ~12:00 PST.**
+
+**Note: start_logger.sh has CRLF line ending issue on Computer B — use direct command instead:**
 
 ```bash
-cd ~/EE297B_ResearchProject
-bash software/acquisition/start_logger.sh \
-  --port /dev/cu.usbmodem1401 \
-  --pair-id 2 --adc-bits 14 --gain 51
+caffeinate -s python3 ~/EE298/software/acquisition/long_duration_logger.py --port /dev/cu.usbmodemF412FA6FA0802 --pair-id 2 --adc-bits 14 --gain 51
 ```
 
 Leave Computer B running unattended. Come back every ~8 hours and check:
@@ -376,6 +375,14 @@ GAP row should appear, logging resumes automatically.
 - [ ] Status file updates every ~60s
 - [ ] No crash or memory blowup
 - [ ] GAP row appears after intentional USB disconnect
+
+**Check-in commands (run on Computer B at ~2026-02-22 12:00 PST):**
+```bash
+cat ~/EE298/data/raw/logger_status.txt
+ls -lh ~/EE298/data/raw/recording_*.csv
+grep "^# GAP" ~/EE298/data/raw/recording_$(date +%Y%m%d).csv
+ps aux | grep long_duration
+```
 
 **Do not inoculate until this test completes.**
 
@@ -533,15 +540,15 @@ grep "^# GAP" data/raw/recording_$(date +%Y%m%d).csv
 | 5. 48-hr headless | System stable for multi-day run | All sub-checks pass, no crash |
 
 **Status:**
-- [ ] TEST 1 — 14-bit ADC resolution — PENDING
-- [ ] TEST 2 — Actuator state columns — PENDING
-- [ ] TEST 3 — GAP detection — PENDING
-- [ ] TEST 4 — Metadata header — PENDING
-- [ ] TEST 5 — 48-hr headless run — PENDING
-- [ ] Hardware caps placed (INA128 V+ and V−) — PENDING
-- [ ] Firmware flashed (v2.0 banner confirmed) — PENDING
-- [ ] Logger transferred to Computer B — PENDING
-- [ ] **INOCULATE** — BLOCKED until all above checked
+- [x] TEST 1 — 14-bit ADC resolution — PASSED 2026-02-20 (adc_raw=389, voltage=118.7mV confirms 16383 denominator)
+- [x] TEST 2 — Actuator state columns — PASSED 2026-02-20 (mister=1 rows confirmed at seq ~5434)
+- [x] TEST 3 — GAP detection — PASSED 2026-02-20 (GAP row at seq_before=6940, ~22s disconnect)
+- [x] TEST 4 — Metadata header — PASSED 2026-02-20 (8 # comment lines confirmed)
+- [ ] TEST 5 — 48-hr headless run — **IN PROGRESS** (started ~12:00 PST, check back 2026-02-22 ~12:00 PST)
+- [x] Hardware caps placed (INA128 V+ and V−) — DONE
+- [x] Firmware flashed (v2.0 banner confirmed — 14-bit line verified) — DONE
+- [x] Logger transferred to Computer B (via git clone https://github.com/theeanthony/EE298.git) — DONE
+- [ ] **INOCULATE** — BLOCKED until Test 5 completes (2026-02-22)
 
 ---
 
