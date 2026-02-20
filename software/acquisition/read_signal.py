@@ -329,6 +329,8 @@ class SignalAcquisition:
 
                 # Log to file
                 self.csv_writer.writerow([t_ms, adc_raw, voltage_mv])
+                if self.sample_count % 10 == 0:
+                    self.log_file.flush()
 
                 # Update plot periodically
                 if self.sample_count % Config.PLOT_UPDATE_INTERVAL == 0:

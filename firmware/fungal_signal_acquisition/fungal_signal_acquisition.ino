@@ -5,17 +5,27 @@
  *
  * This firmware handles:
  * - Signal simulation via PWM + voltage divider (for development)
- * - ADC acquisition at 10 Hz
+ * - ADC acquisition at 10 Hz (14-bit on Uno R4, 10-bit on R3)
  * - Serial output to Python pipeline
  * - Actuator control (mister, fan, LED) via serial commands
  *
  * Hardware connections:
  * - D9: PWM output for signal simulator
- * - A0: ADC input from AD8237 amplifier (or simulator)
+ * - A0: ADC input from INA128 amplifier (or simulator)
  * - D6: LED actuator
  * - D7: Mister relay
  * - D8: Fan relay
+ *
+ * Output format: timestamp_ms,adc_raw,voltage_mV,mister,fan,led
+ *
+ * PAIR_ID: Set at compile time to identify which electrode pair is wired.
+ * Recompile with a different PAIR_ID when manually rotating pairs.
  */
+
+// ============== PAIR IDENTIFICATION ==============
+// Change this when rotating to a different electrode pair.
+// Printed in the startup banner and CSV header comment.
+const int PAIR_ID = 2;
 
 // ============== PIN DEFINITIONS ==============
 const int PWM_PIN = 9;        // Simulator PWM output
@@ -27,6 +37,11 @@ const int FAN_PIN = 8;        // Fan relay control
 // ============== TIMING CONFIGURATION ==============
 const int SAMPLE_PERIOD_MS = 100;   // 10 Hz sampling rate
 const int SIMULATOR_STEP_MS = 50;   // Simulator update rate
+
+// ============== ADC CONFIGURATION ==============
+// Set in setup() based on detected board.
+int ADC_MAX_VALUE = 1023;     // 10-bit default; overridden to 16383 on Uno R4
+float ADC_VREF_MV = 5000.0;  // 5 V reference
 
 // ============== STATE VARIABLES ==============
 unsigned long lastSampleTime = 0;
@@ -63,15 +78,31 @@ void setup() {
     analogWrite(LED_PIN, 0);
 
     // Configure ADC
-    analogReference(DEFAULT);  // 5V reference for Uno, 3.3V for some others
+    #if defined(ARDUINO_UNOR4_MINIMA) || defined(ARDUINO_UNOR4_WIFI)
+        analogReference(AR_DEFAULT);   // Uno R4: use AR_DEFAULT (not DEFAULT)
+        analogReadResolution(14);
+        ADC_MAX_VALUE = 16383;
+        ADC_VREF_MV = 5000.0;
+    #else
+        analogReference(DEFAULT);      // Uno R3 / AVR boards
+        ADC_MAX_VALUE = 1023;
+        ADC_VREF_MV = 5000.0;
+    #endif
 
     // Print header
     Serial.println("# ==========================================");
-    Serial.println("# Fungal Signal Acquisition System v1.0");
+    Serial.println("# Fungal Signal Acquisition System v2.0");
     Serial.println("# EE297B Research Project - SJSU");
     Serial.println("# ==========================================");
+    Serial.print("# Pair ID: ");
+    Serial.println(PAIR_ID);
+    #if defined(ARDUINO_UNOR4_MINIMA) || defined(ARDUINO_UNOR4_WIFI)
+        Serial.println("# ADC: 14-bit (Uno R4) — 0.006 mV/count at 51x gain");
+    #else
+        Serial.println("# ADC: 10-bit (Uno R3 or compatible)");
+    #endif
     Serial.println("# Commands: M/m=mister, F/f=fan, L/l=LED, S/s=simulator");
-    Serial.println("# Format: timestamp_ms,adc_raw,voltage_mV");
+    Serial.println("# Format: timestamp_ms,adc_raw,voltage_mV,mister,fan,led");
     Serial.println("# ==========================================");
 }
 
@@ -126,16 +157,21 @@ void sampleAndTransmit(unsigned long timestamp) {
 
     int adcAvg = adcSum / NUM_SAMPLES;
 
-    // Convert to millivolts
-    // For 5V reference and 10-bit ADC: 5000mV / 1024 = 4.883 mV per count
-    float voltage_mV = (adcAvg / 1023.0) * 5000.0;
+    // Convert to millivolts using detected ADC range
+    float voltage_mV = (adcAvg / (float)ADC_MAX_VALUE) * ADC_VREF_MV;
 
-    // Transmit in CSV format
+    // Transmit in CSV format: timestamp_ms,adc_raw,voltage_mV,mister,fan,led
     Serial.print(timestamp);
     Serial.print(",");
     Serial.print(adcAvg);
     Serial.print(",");
-    Serial.println(voltage_mV, 3);
+    Serial.print(voltage_mV, 3);
+    Serial.print(",");
+    Serial.print(misterState ? 1 : 0);
+    Serial.print(",");
+    Serial.print(fanState ? 1 : 0);
+    Serial.print(",");
+    Serial.println(ledBrightness);
 }
 
 // ============== COMMAND HANDLING ==============
