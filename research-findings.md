@@ -1,7 +1,7 @@
 # Research Findings & Dataset Inventory
 
 ## EE297B — Signal Processing for Fungi Propagation
-**Last updated:** February 16, 2026
+**Last updated:** February 21, 2026
 
 ---
 
@@ -11,7 +11,7 @@
 
 | Reference | Key Findings | Relevance |
 |-----------|-------------|-----------|
-| Buffi et al. (2025) iScience | FPC with ENIG electrodes, STFT analysis, differential pairs, Faraday cage. Signals from *Pleurotus ostreatus* and *Fusarium oxysporum*. Signal change at day 4 post-inoculation. | **Core methodology** — our project replicates this setup |
+| Buffi et al. (2025) iScience | FPC with ENIG electrodes, STFT analysis, differential pairs, Faraday cage. Signals from *Fusarium oxysporum* (primary). *Pleurotus ostreatus* referenced in intro only — not the experimental organism. Signal change at day 4 post-inoculation. | **Core methodology** — our project replicates this setup |
 | Buffi et al. (2025) FEMS Microbiol Rev | Comprehensive review of fungal electrophysiology | Background/context |
 | Adamatzky (2022) Royal Society Open Science | "Language of fungi" — spike trains from 4 species (0.03–2.1 mV, duration 1–21 hrs). Proposed fungal spike "words" via clustering. | Spike characterization, dataset source |
 | Schyck et al. (2024) Global Challenges | Fungal signaling in living composites | Supplementary context |

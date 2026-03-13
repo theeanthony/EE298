@@ -55,8 +55,10 @@ LOG_DIR     = os.path.join(os.path.dirname(__file__), '..', '..', 'data', 'raw')
 LOG_FILE    = os.path.join(LOG_DIR, 'logger.log')
 STATUS_FILE = os.path.join(LOG_DIR, 'logger_status.txt')
 
-CSV_COLUMNS = ['seq', 'wall_clock_utc', 'timestamp_ms', 'adc_raw',
-               'voltage_mV', 'mister', 'fan', 'led']
+CSV_COLUMNS = ['seq', 'wall_clock_utc', 'timestamp_ms',
+               'adc_p2', 'v_p2_mV', 'adc_p3', 'v_p3_mV',
+               'adc_p6_ctrl', 'v_p6_mV', 'adc_p7_ctrl', 'v_p7_mV',
+               'mister', 'fan', 'led']
 
 
 # ============================================================
@@ -158,22 +160,25 @@ def parse_line(line):
     """
     Parse a data row from the Arduino.
 
-    Accepts both old 3-column format (timestamp_ms,adc_raw,voltage_mV) and
-    new 6-column format (timestamp_ms,adc_raw,voltage_mV,mister,fan,led).
+    Expects 12-column format:
+      timestamp_ms,adc_p2,v_p2_mV,adc_p3,v_p3_mV,adc_p4,v_p4_mV,adc_p5,v_p5_mV,mister,fan,led
 
-    Returns (t_ms, adc_raw, voltage_mv, mister, fan, led) or None on failure.
+    Returns (t_ms, adc_p2, v_p2, adc_p3, v_p3, adc_p4, v_p4, adc_p5, v_p5, mister, fan, led)
+    or None on failure.
     """
     parts = line.split(',')
-    if len(parts) < 3:
+    if len(parts) < 12:
         return None
     try:
-        t_ms       = int(parts[0])
-        adc_raw    = int(parts[1])
-        voltage_mv = float(parts[2])
-        mister     = int(parts[3]) if len(parts) >= 4 else 0
-        fan        = int(parts[4]) if len(parts) >= 5 else 0
-        led        = int(parts[5]) if len(parts) >= 6 else 0
-        return t_ms, adc_raw, voltage_mv, mister, fan, led
+        t_ms   = int(parts[0])
+        adc_p2 = int(parts[1]);   v_p2 = float(parts[2])
+        adc_p3 = int(parts[3]);   v_p3 = float(parts[4])
+        adc_p4 = int(parts[5]);   v_p4 = float(parts[6])
+        adc_p5 = int(parts[7]);   v_p5 = float(parts[8])
+        mister = int(parts[9])
+        fan    = int(parts[10])
+        led    = int(parts[11])
+        return t_ms, adc_p2, v_p2, adc_p3, v_p3, adc_p4, v_p4, adc_p5, v_p5, mister, fan, led
     except (ValueError, IndexError):
         return None
 
@@ -287,7 +292,7 @@ def run(port_name, pair_id, adc_bits, gain):
         parsed = parse_line(line)
         if parsed is None:
             continue
-        t_ms, adc_raw, voltage_mv, mister, fan, led = parsed
+        t_ms, adc_p2, v_p2, adc_p3, v_p3, adc_p6, v_p6, adc_p7, v_p7, mister, fan, led = parsed
 
         # ---- Daily rotation ----
         today = date.today()
@@ -302,8 +307,12 @@ def run(port_name, pair_id, adc_bits, gain):
 
         # ---- Write ----
         seq += 1
-        csv_writer.writerow([seq, wall_utc, t_ms, adc_raw,
-                             f'{voltage_mv:.4f}', mister, fan, led])
+        csv_writer.writerow([seq, wall_utc, t_ms,
+                             adc_p2, f'{v_p2:.4f}',
+                             adc_p3, f'{v_p3:.4f}',
+                             adc_p6, f'{v_p6:.4f}',
+                             adc_p7, f'{v_p7:.4f}',
+                             mister, fan, led])
         sample_count += 1
 
         if sample_count % FLUSH_INTERVAL == 0:

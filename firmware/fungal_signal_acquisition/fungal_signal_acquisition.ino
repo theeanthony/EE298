@@ -4,32 +4,26 @@
  * Anthony Contreras & Alex Wong | San Jose State University
  *
  * This firmware handles:
- * - Signal simulation via PWM + voltage divider (for development)
- * - ADC acquisition at 10 Hz (14-bit on Uno R4, 10-bit on R3)
+ * - 4-channel simultaneous ADC acquisition at 10 Hz (14-bit on Uno R4)
  * - Serial output to Python pipeline
  * - Actuator control (mister, fan, LED) via serial commands
  *
  * Hardware connections:
- * - D9: PWM output for signal simulator
- * - A0: ADC input from INA128 amplifier (or simulator)
+ * - A0: INA128 #1 VOUT (Pair 2)
+ * - A1: INA128 #2 VOUT (Pair 3)
+ * - A2: INA128 #3 VOUT (Pair 4)
+ * - A3: INA128 #4 VOUT (Pair 5)
  * - D6: LED actuator
  * - D7: Mister relay
  * - D8: Fan relay
  *
- * Output format: timestamp_ms,adc_raw,voltage_mV,mister,fan,led
- *
- * PAIR_ID: Set at compile time to identify which electrode pair is wired.
- * Recompile with a different PAIR_ID when manually rotating pairs.
+ * Output format:
+ * timestamp_ms,adc_p2,v_p2_mV,adc_p3,v_p3_mV,adc_p4,v_p4_mV,adc_p5,v_p5_mV,mister,fan,led
  */
 
-// ============== PAIR IDENTIFICATION ==============
-// Change this when rotating to a different electrode pair.
-// Printed in the startup banner and CSV header comment.
-const int PAIR_ID = 2;
-
 // ============== PIN DEFINITIONS ==============
-const int PWM_PIN = 9;        // Simulator PWM output
-const int ADC_PIN = A0;       // Signal input from amplifier
+const int PWM_PIN  = 9;   // kept for simulator (unused in production)
+const int ADC_PINS[4] = {A0, A1, A2, A3};  // Pairs 2, 3, 4, 5
 const int LED_PIN = 6;        // LED actuator (PWM capable)
 const int MISTER_PIN = 7;     // Mister relay control
 const int FAN_PIN = 8;        // Fan relay control
@@ -51,7 +45,7 @@ unsigned long lastSimulatorTime = 0;
 int pwmValue = 0;
 int pwmDirection = 1;
 int pwmStepSize = 1;
-bool simulatorEnabled = true;
+bool simulatorEnabled = false;   // OFF by default for live electrode runs
 
 // Actuator states
 bool misterState = false;
@@ -94,15 +88,15 @@ void setup() {
     Serial.println("# Fungal Signal Acquisition System v2.0");
     Serial.println("# EE297B Research Project - SJSU");
     Serial.println("# ==========================================");
-    Serial.print("# Pair ID: ");
-    Serial.println(PAIR_ID);
+    Serial.println("# Pairs: 2(inoculated), 3(inoculated), 6(ctrl), 7(ctrl)");
     #if defined(ARDUINO_UNOR4_MINIMA) || defined(ARDUINO_UNOR4_WIFI)
         Serial.println("# ADC: 14-bit (Uno R4) — 0.006 mV/count at 51x gain");
     #else
         Serial.println("# ADC: 10-bit (Uno R3 or compatible)");
     #endif
     Serial.println("# Commands: M/m=mister, F/f=fan, L/l=LED, S/s=simulator");
-    Serial.println("# Format: timestamp_ms,adc_raw,voltage_mV,mister,fan,led");
+    Serial.println("# Channels: A0=Pair2, A1=Pair3, A2=Pair6(ctrl), A3=Pair7(ctrl)");
+    Serial.println("# Format: timestamp_ms,adc_p2,v_p2_mV,adc_p3,v_p3_mV,adc_p6,v_p6_mV,adc_p7,v_p7_mV,mister,fan,led");
     Serial.println("# ==========================================");
 }
 
@@ -146,26 +140,26 @@ void updateSimulator() {
 
 // ============== SAMPLING ==============
 void sampleAndTransmit(unsigned long timestamp) {
-    // Take multiple readings and average for noise reduction
     const int NUM_SAMPLES = 4;
-    long adcSum = 0;
+    long sums[4] = {0, 0, 0, 0};
 
     for (int i = 0; i < NUM_SAMPLES; i++) {
-        adcSum += analogRead(ADC_PIN);
-        delayMicroseconds(100);  // Small delay between readings
+        for (int p = 0; p < 4; p++) {
+            sums[p] += analogRead(ADC_PINS[p]);
+        }
+        delayMicroseconds(100);
     }
 
-    int adcAvg = adcSum / NUM_SAMPLES;
-
-    // Convert to millivolts using detected ADC range
-    float voltage_mV = (adcAvg / (float)ADC_MAX_VALUE) * ADC_VREF_MV;
-
-    // Transmit in CSV format: timestamp_ms,adc_raw,voltage_mV,mister,fan,led
+    // timestamp_ms,adc_p2,v_p2_mV,adc_p3,v_p3_mV,adc_p4,v_p4_mV,adc_p5,v_p5_mV,mister,fan,led
     Serial.print(timestamp);
-    Serial.print(",");
-    Serial.print(adcAvg);
-    Serial.print(",");
-    Serial.print(voltage_mV, 3);
+    for (int p = 0; p < 4; p++) {
+        int avg = sums[p] / NUM_SAMPLES;
+        float v = (avg / (float)ADC_MAX_VALUE) * ADC_VREF_MV;
+        Serial.print(",");
+        Serial.print(avg);
+        Serial.print(",");
+        Serial.print(v, 3);
+    }
     Serial.print(",");
     Serial.print(misterState ? 1 : 0);
     Serial.print(",");
